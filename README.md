@@ -1,6 +1,6 @@
 # 自研 PerfDog 采集器（FPS / CPU / 内存 / 网络 / 温度）
 
-微信小游戏《火线战场》真机性能采集工具。Windows + USB 安卓真机，ADB 采集，数据本地 JSONL 落盘，**不传云端**。
+微信小游戏真机性能采集工具。Windows + USB 安卓真机，ADB 采集，数据本地 JSONL 落盘，**不传云端**。
 
 > 📖 **指标详解与使用说明**见同目录 `指标说明.md`（FPS/Jank/帧时间/CPU/PSS 与 PerfDog Memory 区别/网络/温度等逐项说明 + 异常排查 + 测试场景建议）。
 
@@ -70,7 +70,7 @@ uv run --no-project python main.py
 ## 快速开始（保姆级）
 
 1. **手机连接电脑**：USB 数据线连上，手机解锁后弹窗选"允许 USB 调试"并勾选"始终允许"。命令行验证：`adb devices` → 应看到 `XXXXXXX  device`（结尾是 `device` 才成功）。
-2. **手机打开游戏**：微信 → 进入《火线战场》→ 停在游戏主界面。⚠️ 保持前台，别退回桌面、别锁屏。
+2. **手机打开游戏**：微信 → 进入被测小游戏 → 停在游戏主界面。⚠️ 保持前台，别退回桌面、别锁屏。
 3. **运行采集器**：打开 `collector` 文件夹，在**地址栏**输入 `cmd` 回车（会直接弹出定位到该目录的命令行），然后：
    - 装了 Python：`python main.py`
    - 没装 Python：`uv run --no-project python main.py`
