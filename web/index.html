@@ -146,7 +146,9 @@
 
   // ---------------- 被测应用下拉（方案 A 2026-08-20） ----------------
   function initTarget() {
-    document.getElementById('tb-refresh').onclick = loadApps;
+    // 刷新按钮显式传 force=1：服务端包列表有 60s TTL 缓存，
+    // 手动刷新必须绕过缓存才能真正重新扫描（2026-08-21）
+    document.getElementById('tb-refresh').onclick = function () { loadApps(true); };
     document.getElementById('tb-select').onchange = onTargetSelect;
     loadApps();       // 加载已装应用列表（构建下拉选项）
     loadTarget();     // 回显当前目标
@@ -161,13 +163,14 @@
     }).catch(function () {});
   }
 
-  function loadApps() {
+  function loadApps(force) {
     var sel = document.getElementById('tb-select');
     var st = document.getElementById('tb-status');
     sel.innerHTML = '<option value="">加载中…</option>';
     st.textContent = '加载应用列表…';
     st.className = 'tb-msg pending';
-    fetch('/api/device-apps').then(function (r) { return r.json(); }).then(function (d) {
+    // force=true（仅刷新按钮传入）→ ?force=1 绕过服务端 60s 包列表缓存
+    fetch('/api/device-apps' + (force ? '?force=1' : '')).then(function (r) { return r.json(); }).then(function (d) {
       appList = (d && d.apps) || [];
       rebuildSelect();
       if (d && d.resolving) {
