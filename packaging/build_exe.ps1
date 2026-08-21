@@ -30,6 +30,8 @@ if ($Mode -eq "onefile") {
     } | Copy-Item -Destination $staging -Recurse -Force
 
     & $py -m PyInstaller --noconfirm --clean --onefile --name perfdog `
+        --paths collector `
+        --hidden-import main --hidden-import web `
         --add-data "packaging\staging\collector;collector" `
         --add-data "web;web" `
         packaging\launcher.py
@@ -40,7 +42,10 @@ if ($Mode -eq "onefile") {
     Write-Host "output/ data is saved next to exe (persistent)."
 } else {
     Write-Host "== Build onedir (thin exe + external collector, dev hot-update) =="
-    & $py -m PyInstaller --noconfirm --clean --onedir --name perfdog packaging\launcher.py
+    & $py -m PyInstaller --noconfirm --clean --onedir --name perfdog `
+        --paths collector `
+        --hidden-import main --hidden-import web `
+        packaging\launcher.py
     if ($LASTEXITCODE -ne 0) { Write-Host "[ERROR] PyInstaller onedir failed"; exit 1 }
     $dist = Join-Path $root "dist\perfdog"
     $collectorDest = Join-Path $dist "collector"
