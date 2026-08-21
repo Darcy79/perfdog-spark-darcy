@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PerfDog 自研工具 · 历史报告</title>
+<link rel="stylesheet" href="/assets/style.css?v=33">
+</head>
+<body>
+<header>
+  <h1>历史报告</h1>
+  <div id="status-bar">
+    <span><a href="/">← 实时看板</a></span>
+  </div>
+</header>
+
+<main class="report-layout">
+  <aside id="run-list" class="run-list">
+    <h3>采集记录</h3>
+    <div class="filter-bar">
+      <input id="filter-keyword" class="filter-input" type="text" placeholder="搜索备注 / 文件名…">
+      <div class="filter-dates">
+        <input id="filter-start" class="filter-input filter-date" type="date" title="开始日期（含当天）">
+        <span class="filter-sep">至</span>
+        <input id="filter-end" class="filter-input filter-date" type="date" title="结束日期（含当天）">
+      </div>
+    </div>
+    <div id="runs"></div>
+  </aside>
+
+  <section class="report-main">
+    <div id="report-placeholder" class="placeholder">← 左侧选择一条采集记录查看报告</div>
+    <div id="report-body" style="display:none">
+      <div class="report-meta" id="report-meta"></div>
+      <div class="drag-hint">↕ 拖动卡片调整顺序 · 悬停看贯穿线 · 点击锁定贯穿线（再点/双击解锁）· 底部时间条：拖两端<span class="hint-highlight">↔缩放</span> · 拖中间<span class="hint-highlight">=平移</span> · 点空白<span class="hint-highlight">=跳转</span></div>
+      <div class="summary" id="report-summary"></div>
+      <section class="chart-card">
+        <div class="chart-head"><h2>FPS / Jank</h2><div id="stat-fps" class="stat-line"></div></div>
+        <div id="chart-fps" class="chart"></div>
+      </section>
+      <section class="chart-card">
+        <div class="chart-head"><h2>帧时间 (ms)</h2><div id="stat-frametime" class="stat-line"></div></div>
+        <div id="chart-frametime" class="chart"></div>
+      </section>
+      <section class="chart-card">
+        <div class="chart-head"><h2>CPU 占用</h2><div id="stat-cpu" class="stat-line"></div></div>
+        <div id="chart-cpu" class="chart"></div>
+      </section>
+      <section class="chart-card">
+        <div class="chart-head"><h2>内存 (PSS/RSS)</h2><div id="stat-mem" class="stat-line"></div></div>
+        <div id="chart-mem" class="chart"></div>
+      </section>
+      <section class="chart-card">
+        <div class="chart-head"><h2>网络流量</h2><div id="stat-net" class="stat-line"></div></div>
+        <div id="chart-net" class="chart"></div>
+      </section>
+      <section class="chart-card">
+        <div class="chart-head"><h2>电池温度 / 功率</h2><div id="stat-temp" class="stat-line"></div></div>
+        <div id="chart-temp" class="chart"></div>
+      </section>
+    </div>
+  </section>
+</main>
+
+<footer><span>自研 PerfDog · 报告数据来自本地 output/*.jsonl，不传云端</span></footer>
+
+<script src="/assets/echarts.min.js?v=33"></script>
+<script src="/assets/app.js?v=33"></script>
+<script>
+(function () {
+  var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
+  var selected = null;
+  var allRuns = [];
+
+  function loadRuns() {
+    fetch('/api/runs').then(function (r) { return r.json(); }).then(function (runs) {
+      allRuns = runs || [];
+      renderRuns();
+    }).catch(function () {});
+  }
+
+  // 按关键词（备注/文件名）与日期范围过滤，然后渲染列表
+  function renderRuns() {
+    var kw = document.getElementById('filter-keyword').value.trim().toLowerCase();
+    var startDate = document.getElementById('filter-start').value;   // "2026-08-12" 或 ""
+    var endDate = document.getElementById('filter-end').value;
+
+    var filtered = allRuns.filter(function (r) {
+      if (kw) {
+        var hit = (r.name || '').toLowerCase().indexOf(kw) >= 0 ||
+                  (r.remark || '').toLowerCase().indexOf(kw) >= 0;
+        if (!hit) return false;
+      }
+      if (startDate || endDate) {
+        // 取 mtime 的日期部分 "YYYY-MM-DD"，字典序即时间序，字符串比较零坑
+        var d = (r.mtime || '').slice(0, 10);
+        if (d.length === 10) {
+          if (startDate && d < startDate) return false;
+          if (endDate && d > endDate) return false;
+        }
+      }
+      return true;
+    });
+
+    var box = document.getElementById('runs');
+    box.innerHTML = '';
+    if (!filtered.length) {
+      box.innerHTML = allRuns.length
+        ? '<div class="empty">无匹配记录</div>'
+        : '<div class="empty">暂无采集记录</div>';
+      return;
+    }
+    filtered.forEach(function (run) {
+      var el = document.createElement('div');
+      el.className = 'run-item' + (selected === run.name ? ' active' : '');
+      var title = run.remark ? run.remark + '　(' + run.name + ')' : run.name;
+      el.innerHTML =
+        '<div class="run-name">' + title +
+          '<span class="rename-btn" title="重命名/添加备注">✎</span></div>' +
+        (run.remark ? '<div class="run-remark">📝 ' + run.remark + '</div>' : '') +
+        '<div class="run-meta">' + run.mtime + ' · ' + run.points + ' 点 · ' + run.size_kb + ' KB</div>';
+      el.onclick = function () { selectRun(run.name); };
+      // 改名按钮：阻止触发列表选择，弹框输入新名称
+      el.querySelector('.rename-btn').onclick = function (e) {
+        e.stopPropagation();
+        renameRun(run.name, run.remark);
+      };
+      box.appendChild(el);
+    });
+  }
+
+  function renameRun(name, current) {
+    var def = current || name.replace(/^.*\//, '').replace(/\.jsonl$/, '');
+    var newname = window.prompt('备注/重命名该次测试（填写测试场景，如：修甲-弱网-第一次）：', def);
+    if (newname === null) return;   // 取消
+    if (newname === def) return;
+    fetch('/api/rename?name=' + encodeURIComponent(name) +
+          '&newname=' + encodeURIComponent(newname), { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (res && res.ok) loadRuns();
+        else alert('重命名失败: ' + (res && res.error || '未知错误'));
+      })
+      .catch(function () { alert('重命名失败'); });
+  }
+
+  function selectRun(name) {
+    selected = name;
+    loadRuns();
+    fetch('/api/report?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); })
+      .then(function (rows) {
+        if (!Array.isArray(rows) || !rows.length) {
+          alert('读取失败或文件为空');
+          return;
+        }
+        document.getElementById('report-placeholder').style.display = 'none';
+        document.getElementById('report-body').style.display = 'block';
+        // 被测应用：从每行 target 提取（支持中途热切换显示分界）
+        var targets = [];
+        var lastT = null;
+        rows.forEach(function (r) {
+          if (r.target && r.target !== lastT) { targets.push({ pkg: r.target, t: r.t_ms }); lastT = r.target; }
+        });
+        var meta = name + ' · ' + rows.length + ' 个采样点';
+        if (targets.length) {
+          var tdesc = '被测: ' + targets[0].pkg;
+          for (var i = 1; i < targets.length; i++) {
+            tdesc += ' → ' + targets[i].pkg + '(@' + Math.round(targets[i].t / 1000) + 's)';
+          }
+          meta += ' · ' + tdesc;
+        }
+        document.getElementById('report-meta').textContent = meta;
+        if (!charts.fps) {
+          charts.fps = window.PerfCharts.makeChart('chart-fps', 'report');
+          charts.frametime = window.PerfCharts.makeChart('chart-frametime', 'report');
+          charts.cpu = window.PerfCharts.makeChart('chart-cpu', 'report');
+          charts.mem = window.PerfCharts.makeChart('chart-mem', 'report');
+          charts.net = window.PerfCharts.makeChart('chart-net', 'report');
+          charts.temp = window.PerfCharts.makeChart('chart-temp', 'report');
+          window.PerfCharts.enableLink('report');   // 垂直线贯穿各模块
+          window.PerfCharts.enableClickPin('report'); // 点击锁定贯穿线
+        }
+        window.PerfCharts.renderAll(charts, rows, { zoom: true });
+        window.PerfCharts.updateStats(charts, rows);
+        window.PerfCharts.renderSummary('report-summary', window.PerfCharts.computeStats(rows));
+        window.PerfCharts.clearPin();   // 切换报告时清除上一份的锁定贯穿线
+        window.PerfCharts.setPinData(rows); // 供点击锁定显示各模块时刻数据
+        window.PerfCharts.clearTimeSliders();           // 重建前清旧拖动条
+        window.PerfCharts.createTimeSliders(charts, rows); // 自写 PerfDog 风格拖动条
+        // 模式1：加载 logcat 事件标注层（场景/console 事件叠加到曲线）
+        fetch('/api/events?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); })
+          .then(function (events) {
+            if (Array.isArray(events) && events.length) {
+              window.PerfCharts.renderEvents(charts, rows, events);
+            }
+          }).catch(function () {});
+      }).catch(function (e) { alert('读取失败: ' + e); });
+  }
+
+  // 筛选控件：输入/切换即时过滤（关键词防抖：输入停顿 200ms 后生效）
+  var debounceTimer = null;
+  document.getElementById('filter-keyword').addEventListener('input', function () {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(renderRuns, 200);
+  });
+  document.getElementById('filter-start').addEventListener('change', renderRuns);
+  document.getElementById('filter-end').addEventListener('change', renderRuns);
+
+  window.PerfCharts.initSortable('#report-body');
+  loadRuns();
+  setInterval(loadRuns, 5000);
+})();
+</script>
+</body>
+</html>

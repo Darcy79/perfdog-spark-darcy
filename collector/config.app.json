@@ -1,0 +1,7 @@
+{
+  "package": "com.example.game",
+  "process_pattern": "",
+  "serial": "",
+  "interval_ms": 1000,
+  "duration_s": 0
+}

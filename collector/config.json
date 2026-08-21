@@ -1,0 +1,7 @@
+{
+  "package": "com.tencent.mm",
+  "process_pattern": "appbrand",
+  "serial": "",
+  "interval_ms": 1000,
+  "duration_s": 0
+}

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 本机缓存（应用名解析缓存，每台设备不同）
+collector/.app_labels.json
+
+# 采集数据（测试记录：jsonl / 自包含 html / 事件标注）——如要上传测试数据，删除这一行即可
+collector/output/
+
+# 一次性验证产物（非代码）
+验证统计卡片.html
+
+# 其它
+*.log

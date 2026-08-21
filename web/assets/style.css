@@ -1,0 +1,212 @@
+/* 自研 PerfDog Web 看板样式 */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  background: #10151c;
+  color: #cfd8dc;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow-x: hidden;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 12px 20px;
+  background: #16212c;
+  border-bottom: 1px solid #263545;
+}
+
+header h1 { font-size: 18px; color: #4fc3f7; font-weight: 600; flex: 0 0 auto; white-space: nowrap; }
+
+#status-bar {
+  display: flex; gap: 16px; flex-wrap: wrap;
+  font-size: 13px; color: #90a4ae; margin-left: auto;
+}
+#status-bar > span { white-space: nowrap; }
+#status-bar a { color: #4fc3f7; text-decoration: none; }
+
+/* 被测应用下拉（方案 A 2026-08-20） */
+#target-box {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: #90a4ae; margin-left: auto;
+}
+.tb-label { white-space: nowrap; }
+#tb-select {
+  background: #1a2530; color: #cfd8dc;
+  border: 1px solid #263545; border-radius: 5px;
+  font-size: 12px; padding: 3px 6px; outline: none;
+  max-width: 280px; min-width: 140px;
+  color-scheme: dark;
+}
+#tb-select:focus { border-color: #4fc3f7; }
+#tb-refresh {
+  background: #1a2530; color: #4fc3f7;
+  border: 1px solid #263545; border-radius: 5px;
+  cursor: pointer; font-size: 13px; padding: 2px 8px; line-height: 1.4;
+}
+#tb-refresh:hover { border-color: #4fc3f7; }
+.tb-msg { font-size: 11px; white-space: nowrap; }
+.tb-msg.pending { color: #ffd54f; }
+.tb-msg.ok { color: #a5d6a7; }
+.tb-msg.err { color: #ef5350; }
+.tb-msg.warn { color: #ffb74d; }
+
+.st-pill {
+  padding: 2px 10px; border-radius: 10px; font-size: 12px;
+}
+.st-pill.running { background: #1b5e20; color: #a5d6a7; }
+.st-pill.idle { background: #37474f; color: #90a4ae; }
+
+main { flex: 1; padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; min-width: 0; align-items: stretch; }
+
+.chart-card {
+  background: #16212c;
+  border: 1px solid #263545;
+  border-radius: 8px;
+  padding: 10px 12px 6px;
+  overflow: hidden;      /* 任何溢出都裁剪在卡片内，杜绝与相邻元素重叠 */
+  min-width: 0;
+}
+
+.chart-head {
+  display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; column-gap: 12px; row-gap: 2px; margin-bottom: 4px;
+  min-height: 22px;
+}
+.chart-head h2 { font-size: 14px; color: #b0bec5; font-weight: 600; flex: 0 0 auto; white-space: nowrap; }
+.stat-line {
+  font-size: 12px; color: #ffd54f; flex: 1 1 auto; min-width: 0;
+  text-align: right; line-height: 1.6;
+  overflow-wrap: break-word;
+}
+
+.chart { width: 100%; height: 220px; }
+
+/* 卡片拖拽排序 */
+.chart-card { transition: opacity .15s, border-color .15s, box-shadow .15s; }
+.chart-card.sortable { cursor: grab; }
+.chart-card.dragging { opacity: .45; border-style: dashed; }
+.chart-card.drop-target { border-color: #4fc3f7; box-shadow: 0 0 0 1px #4fc3f7 inset; }
+.drag-hint { font-size: 11px; color: #546e7a; margin-bottom: 4px; text-align: right; }
+.hint-highlight { color: #4fc3f7; font-weight: bold; }
+/* 自定义时间拖动条（PerfDog 风格 v28）：体积小、按下即拖 */
+.pd-slider { position: relative; height: 14px; margin-top: 5px; background: #101a26; border: 1px solid #263545; border-radius: 4px; user-select: none; touch-action: none; cursor: default; }
+.pd-wave { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+.pd-selection { position: absolute; top: 1px; bottom: 1px; background: rgba(79,195,247,.28); border-left: 1px solid #4fc3f7; border-right: 1px solid #4fc3f7; border-radius: 2px; cursor: grab; }
+.pd-selection:active { cursor: grabbing; }
+.pd-handle { position: absolute; top: -4px; bottom: -4px; width: 7px; margin-left: -3.5px; background: #4fc3f7; border-radius: 2px; cursor: ew-resize; box-shadow: 0 0 5px rgba(79,195,247,.7); }
+/* 点击锁定后标题行右侧的数据卡（V22 效果，与蓝线旁浮层并存） */
+.pin-data {
+  display: none; font-size: 11px; color: #4fc3f7;
+  background: rgba(79, 195, 247, .08); border: 1px solid rgba(79, 195, 247, .35);
+  padding: 1px 8px; border-radius: 4px; margin-left: 8px; vertical-align: middle;
+}
+
+/* 点击锁定后蓝线位置的 tooltip 风格数据浮层 */
+.pin-tip {
+  display: none; position: absolute; top: 6px; z-index: 6;
+  background: rgba(30, 42, 56, .96); border: 1px solid #4fc3f7; color: #e3f2fd;
+  font-size: 11px; line-height: 1.5; padding: 4px 9px; border-radius: 5px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .45); pointer-events: none;
+  white-space: pre-line; max-width: 220px;
+}
+
+/* 点击锁定贯穿线（DOM 覆盖层，独立于 ECharts 渲染，必可见） */
+.pin-line {
+  position: absolute; top: 0; bottom: 0; left: -9999px;
+  width: 2px; background: #4fc3f7; pointer-events: none; z-index: 10;
+  box-shadow: 0 0 5px rgba(79, 195, 247, 0.8);
+}
+
+/* 统计汇总卡片 */
+.summary {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px; margin-bottom: 16px;
+}
+.summary .item {
+  background: #16212c; border: 1px solid #263545; border-radius: 8px;
+  padding: 10px 14px;
+}
+.summary .item .k { font-size: 11px; color: #78909c; white-space: nowrap; }
+.summary .item .v { font-size: 18px; color: #4fc3f7; font-weight: 600; margin-top: 2px; }
+.summary .item .v small { font-size: 11px; color: #78909c; font-weight: 400; }
+
+footer {
+  padding: 10px 20px; font-size: 12px; color: #546e7a;
+  border-top: 1px solid #263545;
+}
+footer a { color: #4fc3f7; text-decoration: none; }
+
+/* 历史报告页 */
+.report-layout { flex-direction: row; align-items: stretch; gap: 16px; }
+.run-list {
+  width: 300px; flex: 0 0 300px;
+  background: #16212c; border: 1px solid #263545; border-radius: 8px;
+  padding: 12px; max-height: calc(100vh - 160px); overflow-y: auto;
+}
+.run-list h3 { font-size: 14px; color: #4fc3f7; margin-bottom: 8px; }
+
+/* 记录筛选栏 */
+.filter-bar { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.filter-input {
+  background: #1a2530; border: 1px solid #263545; border-radius: 6px;
+  color: #cfd8dc; font-size: 12px; padding: 6px 8px; outline: none;
+  font-family: inherit;
+}
+.filter-input::placeholder { color: #546e7a; }
+.filter-input:focus { border-color: #4fc3f7; }
+/* 日期选择器：深色配色 + 系统深色控件（日历图标可见） */
+.filter-date { color-scheme: dark; cursor: pointer; width: 100%; }
+.filter-dates { display: flex; align-items: center; gap: 6px; }
+.filter-sep { font-size: 12px; color: #78909c; flex: 0 0 auto; }
+.run-item {
+  padding: 8px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid transparent; margin-bottom: 6px;
+}
+.run-item:hover { background: #1c2a38; }
+.run-item.active { background: #22374a; border-color: #4fc3f7; }
+.run-name { font-size: 13px; color: #cfd8dc; word-break: break-all; display: flex; align-items: center; }
+.rename-btn {
+  color: #4fc3f7; cursor: pointer; font-size: 12px; margin-left: 6px;
+  opacity: 0.55; flex: 0 0 auto; user-select: none;
+}
+.rename-btn:hover { opacity: 1; }
+.run-remark {
+  font-size: 11px; color: #80cbc4; margin-top: 3px;
+  word-break: break-all; background: rgba(79,195,247,0.08);
+  border-radius: 4px; padding: 2px 6px; display: inline-block;
+}
+.run-meta { font-size: 11px; color: #78909c; margin-top: 3px; }
+.empty { color: #546e7a; font-size: 13px; padding: 12px 4px; }
+
+.report-main { flex: 1; min-width: 0; }
+.placeholder {
+  display: flex; align-items: center; justify-content: center;
+  height: 60vh; color: #546e7a; font-size: 14px;
+}
+.report-meta {
+  font-size: 13px; color: #90a4ae; margin-bottom: 12px; padding: 8px 12px;
+  background: #16212c; border: 1px solid #263545; border-radius: 6px;
+  overflow-wrap: break-word;
+}
+
+@media (max-width: 900px) {
+  .report-layout { flex-direction: column; }
+  .run-list { width: 100%; flex: none; max-height: 200px; }
+}
+
+/* 窄屏：顶部栏纵向堆叠，避免挤压重叠 */
+@media (max-width: 640px) {
+  header { flex-direction: column; align-items: flex-start; gap: 6px; }
+  #target-box { margin-left: 0; flex-wrap: wrap; }
+  #status-bar { margin-left: 0; flex-wrap: wrap; }
+  main { padding: 12px; }
+  .chart-head { flex-direction: column; align-items: flex-start; }
+  .stat-line { text-align: left; width: 100%; }
+}

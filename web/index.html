@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PerfDog 自研工具 · 实时看板</title>
+<link rel="stylesheet" href="/assets/style.css?v=33">
+</head>
+<body>
+<header>
+  <h1>性能采集 · 实时看板</h1>
+  <div id="target-box">
+    <label for="tb-select" class="tb-label">被测应用</label>
+    <select id="tb-select" title="切换被测目标（微信小游戏 / 已安装 App / 自定义包名）"></select>
+    <button id="tb-refresh" type="button" title="刷新已安装应用列表">↻</button>
+    <span id="tb-status"></span>
+  </div>
+  <div id="status-bar">
+    <span id="st-device">设备: -</span>
+    <span id="st-pid">进程: -</span>
+    <span id="st-run">本次: -</span>
+    <span id="st-state" class="st-pill idle">未采集</span>
+    <span id="st-elapsed">时长: 0s</span>
+  </div>
+</header>
+
+<main>
+  <div class="drag-hint">↕ 拖动卡片可调整顺序（自动记住）</div>
+  <section class="chart-card">
+    <div class="chart-head"><h2>FPS / Jank</h2><div id="stat-fps" class="stat-line"></div></div>
+    <div id="chart-fps" class="chart"></div>
+  </section>
+  <section class="chart-card">
+    <div class="chart-head"><h2>帧时间 (ms)</h2><div id="stat-frametime" class="stat-line"></div></div>
+    <div id="chart-frametime" class="chart"></div>
+  </section>
+  <section class="chart-card">
+    <div class="chart-head"><h2>CPU 占用</h2><div id="stat-cpu" class="stat-line"></div></div>
+    <div id="chart-cpu" class="chart"></div>
+  </section>
+  <section class="chart-card">
+    <div class="chart-head"><h2>内存 (PSS/RSS)</h2><div id="stat-mem" class="stat-line"></div></div>
+    <div id="chart-mem" class="chart"></div>
+  </section>
+  <section class="chart-card">
+    <div class="chart-head"><h2>网络流量</h2><div id="stat-net" class="stat-line"></div></div>
+    <div id="chart-net" class="chart"></div>
+  </section>
+  <section class="chart-card">
+    <div class="chart-head"><h2>电池温度 / 功率</h2><div id="stat-temp" class="stat-line"></div></div>
+    <div id="chart-temp" class="chart"></div>
+  </section>
+</main>
+
+<footer>
+  <span>自研 PerfDog · 数据仅存本地（output/*.jsonl）· <a href="/report.html">历史报告 →</a></span>
+</footer>
+
+<script src="/assets/echarts.min.js?v=33"></script>
+<script src="/assets/app.js?v=33"></script>
+<script>
+(function () {
+  var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
+  var startedAt = null;
+  var rows = [];
+  var pollTimer = null;
+  var currentTarget = null;   // 当前被测目标 {package, process_pattern}
+  var appList = [];           // 已安装应用缓存
+
+  function init() {
+    charts.fps = window.PerfCharts.makeChart('chart-fps');
+    charts.frametime = window.PerfCharts.makeChart('chart-frametime');
+    charts.cpu = window.PerfCharts.makeChart('chart-cpu');
+    charts.mem = window.PerfCharts.makeChart('chart-mem');
+    charts.net = window.PerfCharts.makeChart('chart-net');
+    charts.temp = window.PerfCharts.makeChart('chart-temp');
+    initTarget();
+    refreshStatus();
+    window.PerfCharts.initSortable('main');
+    setInterval(refreshStatus, 2000);
+    // 先拉一次已采集的数据做初始渲染，再开启 SSE 实时流
+    fetch('/api/latest').then(function (r) { return r.json(); }).then(function (data) {
+      if (data && data.length) { rows = data; render(); }
+      startStream();
+    }).catch(function () { startStream(); });
+  }
+
+  function render() {
+    if (!rows.length) return;
+    window.PerfCharts.renderAll(charts, rows);
+    window.PerfCharts.updateStats(charts, rows);
+    if (startedAt) {
+      var secs = Math.round((rows[rows.length - 1].t_ms || 0) / 1000);
+      document.getElementById('st-elapsed').textContent = '时长: ' + secs + 's';
+    }
+  }
+
+  function startStream() {
+    // SSE 优先（毫秒级推流）；不支持或断开自动降级为 1s 轮询
+    if (typeof EventSource === 'undefined') { pollTimer = setInterval(poll, 1000); return; }
+    var es = new EventSource('/api/stream');
+    es.onmessage = function (e) {
+      try {
+        var row = JSON.parse(e.data);
+        rows.push(row);
+        if (rows.length > 300) rows = rows.slice(-300);
+        render();
+      } catch (err) {}
+    };
+    es.onerror = function () {
+      es.close();
+      if (!pollTimer) pollTimer = setInterval(poll, 1000);
+    };
+  }
+
+  function poll() {
+    fetch('/api/latest').then(function (r) { return r.json(); }).then(function (data) {
+      if (data && data.length) { rows = data; render(); }
+    }).catch(function () {});
+  }
+
+  function refreshStatus() {
+    fetch('/api/status').then(function (r) { return r.json(); }).then(function (s) {
+      document.getElementById('st-device').textContent = '设备: ' + (s.device || '-');
+      document.getElementById('st-pid').textContent = '进程: ' + (s.pid || '-');
+      document.getElementById('st-run').textContent = '本次: ' + (s.run_id || '-');
+      var pill = document.getElementById('st-state');
+      if (s.running) {
+        pill.className = 'st-pill running';
+        pill.textContent = '采集中';
+        startedAt = s.started_at ? new Date('1970-01-01T' + s.started_at + 'Z') : null;
+      } else {
+        pill.className = 'st-pill idle';
+        pill.textContent = '已停止';
+        startedAt = null;
+      }
+      // 同步被测目标（采集器启动默认目标 / 其它端切换都会反映到这里）
+      var pkg = s.target;
+      var pat = s.process_pattern || '';
+      if (pkg && (!currentTarget || currentTarget.package !== pkg || currentTarget.process_pattern !== pat)) {
+        currentTarget = { package: pkg, process_pattern: pat };
+        updateSelectValue();
+      }
+    }).catch(function () {});
+  }
+
+  // ---------------- 被测应用下拉（方案 A 2026-08-20） ----------------
+  function initTarget() {
+    document.getElementById('tb-refresh').onclick = loadApps;
+    document.getElementById('tb-select').onchange = onTargetSelect;
+    loadApps();       // 加载已装应用列表（构建下拉选项）
+    loadTarget();     // 回显当前目标
+  }
+
+  function loadTarget() {
+    fetch('/api/target').then(function (r) { return r.json(); }).then(function (t) {
+      if (t && t.package) {
+        currentTarget = { package: t.package, process_pattern: t.process_pattern || '' };
+        updateSelectValue();
+      }
+    }).catch(function () {});
+  }
+
+  function loadApps() {
+    var sel = document.getElementById('tb-select');
+    var st = document.getElementById('tb-status');
+    sel.innerHTML = '<option value="">加载中…</option>';
+    st.textContent = '加载应用列表…';
+    st.className = 'tb-msg pending';
+    fetch('/api/device-apps').then(function (r) { return r.json(); }).then(function (d) {
+      appList = (d && d.apps) || [];
+      rebuildSelect();
+      if (d && d.ok) {
+        st.textContent = '';
+        st.className = 'tb-msg';
+      } else {
+        st.textContent = '⚠ ' + (d && d.error || '无设备');
+        st.className = 'tb-msg warn';
+      }
+    }).catch(function () {
+      rebuildSelect();
+      st.textContent = '⚠ 应用列表加载失败';
+      st.className = 'tb-msg warn';
+    });
+  }
+
+  function rebuildSelect() {
+    var sel = document.getElementById('tb-select');
+    var html = '';
+    html += '<optgroup label="预设">';
+    html += '<option value="mm">微信小游戏 (com.tencent.mm)</option>';
+    html += '</optgroup>';
+    if (appList.length) {
+      html += '<optgroup label="已安装应用（点选即测）">';
+      for (var i = 0; i < appList.length; i++) {
+        var a = appList[i];
+        var label = (a && a.label) || (a && a.pkg) || '';
+        // 有中文名（label≠包名）→ 显示 "中文名 (包名)"，否则只显示包名
+        var disp = (label !== a.pkg) ? label + ' (' + a.pkg + ')' : label;
+        html += '<option value="' + esc(a.pkg) + '">' + esc(disp) + '</option>';
+      }
+      html += '</optgroup>';
+    }
+    html += '<option value="__custom__">自定义包名…</option>';
+    sel.innerHTML = html;
+    updateSelectValue();
+  }
+
+  function updateSelectValue() {
+    var sel = document.getElementById('tb-select');
+    if (!sel || !currentTarget || !currentTarget.package) { sel.value = ''; return; }
+    var p = currentTarget.package;
+    // 微信小游戏：预设项（带 appbrand 进程模式）
+    if (p === 'com.tencent.mm' && (currentTarget.process_pattern || '') === 'appbrand') {
+      sel.value = 'mm';
+      return;
+    }
+    var found = appList.some(function (a) { return a.pkg === p; });
+    if (found) { sel.value = p; return; }
+    // 自定义 / 不在已装列表：临时加一个"当前"项回显
+    var cur = sel.querySelector('option[value="__cur__"]');
+    if (!cur) {
+      cur = document.createElement('option');
+      cur.value = '__cur__';
+      sel.appendChild(cur);
+    }
+    cur.textContent = '当前: ' + p + (currentTarget.process_pattern ? '（' + currentTarget.process_pattern + '）' : '');
+    sel.value = '__cur__';
+  }
+
+  function onTargetSelect() {
+    var sel = document.getElementById('tb-select');
+    var v = sel.value;
+    if (v === '__cur__' || !v) { updateSelectValue(); return; }
+    if (v === '__custom__') {
+      var pkg = window.prompt('输入被测应用包名（如 com.example.game）：');
+      if (!pkg || !pkg.trim()) { updateSelectValue(); return; }
+      doSwitchTarget(pkg.trim(), '');
+      return;
+    }
+    if (v === 'mm') { doSwitchTarget('com.tencent.mm', 'appbrand'); return; }
+    doSwitchTarget(v, '');
+  }
+
+  function doSwitchTarget(pkg, pat) {
+    var st = document.getElementById('tb-status');
+    st.textContent = '切换中…';
+    st.className = 'tb-msg pending';
+    fetch('/api/switch-target?package=' + encodeURIComponent(pkg) +
+          '&process_pattern=' + encodeURIComponent(pat || ''), { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.ok) {
+          st.textContent = '✔ ' + (d.message || '已切换');
+          st.className = 'tb-msg ok';
+          currentTarget = { package: pkg, process_pattern: pat || '' };
+          // 清空实时数据重画：新目标从零开始
+          rows = [];
+          Object.keys(charts).forEach(function (k) { if (charts[k]) charts[k].clear(); });
+          updateSelectValue();
+        } else {
+          st.textContent = '✘ ' + (d.error || '切换失败');
+          st.className = 'tb-msg err';
+          updateSelectValue();
+        }
+      })
+      .catch(function () {
+        st.textContent = '✘ 请求失败';
+        st.className = 'tb-msg err';
+        updateSelectValue();
+      });
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
