@@ -17,14 +17,14 @@
  *     import * as PerfDogSDK from "./perfdog-sdk";
  *     PerfDogSDK.start({ sampleIntervalMs: 1000 });
  *     // 场景切换处：
- *     PerfDogSDK.scene("战斗-甲修");
+ *     PerfDogSDK.scene("scene_name");
  *     // 关键节点：
  *     PerfDogSDK.mark("修甲开始");
  *
  * 数据格式（每行一个 JSON，t_ms 与采集器 JSONL 同时间轴）：
  *   {"t_ms":1234,"fps":60,"frameTimeMs":16.7,"raf":{"fps":60,"avgGapMs":16.6,"maxGapMs":80},
  *    "engine":{"drawCall":42,"triangles":3000,"gpuMemMB":12.5,"sprite2D":123,"sprite3D":456},
- *    "thread":{"busyPct":12.3,"overrun":2},"scene":"战斗-甲修"}
+ *    "thread":{"busyPct":12.3,"overrun":2},"scene":"scene_name"}
  *
  * ⚠️ 真机验证点（release 发布版统计项可能被裁剪，见架构文档 §5.1）：
  *   - SDK 启动时自动探测引擎统计可用性并打印，请把日志回传以确认哪些字段可用
@@ -294,7 +294,7 @@
       console.log('[PerfDogSDK] stopped, samples=' + state.samples.length);
     },
 
-    /** 场景打点：scene('战斗-甲修')，压栈当前场景 */
+    /** 场景打点：scene('scene_name')，压栈当前场景 */
     scene: function (name) {
       if (!CONFIG.sceneTracking) return;
       state.sceneStack.push(String(name));
