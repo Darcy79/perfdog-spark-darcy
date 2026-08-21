@@ -97,6 +97,20 @@ class Adb:
         quoted = ["'" + a.replace("'", "'\\''") + "'" for a in args]
         return self._run(["shell"] + quoted)
 
+    def exec_out(self, args, timeout=30):
+        """执行 adb exec-out，返回原始 stdout（bytes，保留二进制）。
+
+        用于读取 APK 内部二进制文件（unzip -p 提取的 AXML / resources.arsc）——
+        shell() 的 text 模式会破坏二进制数据，必须走 exec-out。
+        """
+        quoted = ["'" + a.replace("'", "'\\''") + "'" for a in args]
+        proc = subprocess.run(
+            self._base + ["exec-out"] + quoted,
+            capture_output=True,
+            timeout=timeout,
+        )
+        return proc.stdout
+
     def _run(self, args, timeout=20):
         proc = subprocess.run(
             self._base + args,

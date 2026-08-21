@@ -23,6 +23,8 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+from apk_label import get_apk_label
+
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web")
 RING_SIZE = 300  # 实时看板保留最近 300 个采样点
 # 已装应用 label 缓存（避免每次下拉都逐包 aapt 解析）：按设备序列号分 key
@@ -40,6 +42,7 @@ class WebServer:
                        "target": None, "process_pattern": ""}
         self.adb = adb              # 采集器注入的 adb 实例（离线看板为 None）
         self.switch_cb = switch_cb  # 采集器注入的热切换回调 apply_target(package, pattern)
+        self._resolving = False     # 后台应用名(label)解析进行中
         self._lock = threading.Lock()
         self._httpd = None
         self._thread = None
@@ -66,6 +69,87 @@ class WebServer:
         """清空实时缓冲（切换被测目标后新目标从零开始显示）。"""
         with self._lock:
             self.latest = []
+
+    # ---------------- 已装应用名（label）解析 ----------------
+    # label 解析较慢（逐包 unzip + Python 解析，adb 并发被 server 串行化、并行无效），
+    # 采用懒解析：下拉秒回缓存/包名，后台串行补齐，前端轮询刷新。
+    def _load_app_labels(self, serial):
+        try:
+            with open(APP_LABEL_CACHE, encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get(serial, {})
+        except Exception:
+            return {}
+
+    def _save_app_labels(self, serial, labels):
+        try:
+            data = {}
+            if os.path.isfile(APP_LABEL_CACHE):
+                with open(APP_LABEL_CACHE, encoding="utf-8") as f:
+                    data = json.load(f)
+            data[serial] = labels
+            with open(APP_LABEL_CACHE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _find_aapt(self):
+        """探测设备上可用的 aapt/aapt2 路径；找不到返回 None（降级 apk 解析）。"""
+        try:
+            out = self.adb.shell(["sh", "-c",
+                "ls /system/bin/aapt /system/bin/aapt2 /system/xbin/aapt "
+                "/system/xbin/aapt2 2>/dev/null"])
+        except Exception:
+            return None
+        for line in out.splitlines():
+            if line.strip():
+                return line.strip()
+        return None
+
+    def _aapt_label(self, aapt, apk_path):
+        """aapt dump badging 解析 application-label；失败返回 None。"""
+        try:
+            out = self.adb.shell([aapt, "dump", "badging", apk_path])
+        except Exception:
+            return None
+        for line in out.splitlines():
+            s = line.strip()
+            m = re.search(r"application-label:['\"](.*?)['\"]", s)
+            if m:
+                return m.group(1)
+            m2 = re.search(r"application:\s+label='(.*?)'", s)
+            if m2:
+                return m2.group(1)
+        return None
+
+    def _resolve_labels_async(self, serial, todo):
+        """后台串行解析未缓存的应用名，解析成功即写入缓存。"""
+        labels = self._load_app_labels(serial)
+        aapt = self._find_aapt()
+        try:
+            for pkg, apk in todo:
+                if labels.get(pkg):
+                    continue
+                try:
+                    if aapt:
+                        lbl = self._aapt_label(aapt, apk) or ""
+                    else:
+                        lbl = get_apk_label(self.adb, pkg, apk) or ""
+                except Exception as e:
+                    print(f"[!] label解析 {pkg} 异常: {e}", flush=True)
+                    lbl = ""
+                if lbl:
+                    labels[pkg] = lbl
+                    # 每成功一个立即持久化：前端轮询能逐步看到中文名，
+                    # 不必等全部（2-4 分钟）解析完。
+                    self._save_app_labels(serial, labels)
+                    print(f"[+] 应用名解析: {pkg} = {lbl}", flush=True)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+        finally:
+            with self._lock:
+                self._resolving = False
 
     # ---------------- HTTP 服务 ----------------
     def start(self):
@@ -252,73 +336,27 @@ class WebServer:
                             seen.add(pkg)
                             apps.append({"pkg": pkg, "apk": path})
                 apps.sort(key=lambda a: a["pkg"])
-                # 解析/复用 label（有缓存先读缓存，只对缺失项跑 aapt）
-                labels = self._load_app_labels(server.adb.serial)
-                aapt = self._find_aapt() if server.adb else None
-                changed = False
+                labels = server._load_app_labels(server.adb.serial)
+                # 未解析的包：后台串行解析应用名（adb 并发被 server 串行化，并行无效），
+                # 本次下拉先显示包名，前端轮询自动刷新。
+                todo = [(a["pkg"], a["apk"]) for a in apps
+                        if not labels.get(a["pkg"]) and a["apk"]]
+                # resolving = 后台是否正在解析（含上次请求已启动的线程）；
+                # 不能只返回"本次是否启动"，否则后台在跑时前端会停止轮询。
+                with server._lock:
+                    resolving = server._resolving
+                    if todo and not server._resolving:
+                        server._resolving = True
+                        resolving = True
+                        threading.Thread(
+                            target=server._resolve_labels_async,
+                            args=(server.adb.serial, todo),
+                            daemon=True,
+                        ).start()
                 for a in apps:
-                    lbl = labels.get(a["pkg"])
-                    if lbl is None and aapt and a["apk"]:
-                        lbl = self._aapt_label(aapt, a["apk"]) or ""
-                        labels[a["pkg"]] = lbl
-                        changed = True
-                    a["label"] = (lbl or a["pkg"])
+                    a["label"] = labels.get(a["pkg"]) or a["pkg"]
                     a.pop("apk", None)
-                if changed:
-                    self._save_app_labels(server.adb.serial, labels)
-                return {"ok": True, "apps": apps}
-
-            def _find_aapt(self):
-                """探测设备上可用的 aapt/aapt2 路径；找不到返回 None（降级显示包名）。"""
-                try:
-                    out = server.adb.shell(["sh", "-c",
-                        "ls /system/bin/aapt /system/bin/aapt2 /system/xbin/aapt "
-                        "/system/xbin/aapt2 2>/dev/null"])
-                except Exception:
-                    return None
-                for line in out.splitlines():
-                    if line.strip():
-                        return line.strip()
-                return None
-
-            def _aapt_label(self, aapt, apk_path):
-                """aapt dump badging 解析 application-label；失败返回 None。"""
-                try:
-                    out = server.adb.shell([aapt, "dump", "badging", apk_path])
-                except Exception:
-                    return None
-                for line in out.splitlines():
-                    s = line.strip()
-                    # 常见两种格式：
-                    #   application-label:'中文名'
-                    #   application: label='中文名' icon='...'
-                    m = re.search(r"application-label:['\"](.*?)['\"]", s)
-                    if m:
-                        return m.group(1)
-                    m2 = re.search(r"application:\s+label='(.*?)'", s)
-                    if m2:
-                        return m2.group(1)
-                return None
-
-            def _load_app_labels(self, serial):
-                try:
-                    with open(APP_LABEL_CACHE, encoding="utf-8") as f:
-                        data = json.load(f)
-                    return data.get(serial, {})
-                except Exception:
-                    return {}
-
-            def _save_app_labels(self, serial, labels):
-                try:
-                    data = {}
-                    if os.path.isfile(APP_LABEL_CACHE):
-                        with open(APP_LABEL_CACHE, encoding="utf-8") as f:
-                            data = json.load(f)
-                    data[serial] = labels
-                    with open(APP_LABEL_CACHE, "w", encoding="utf-8") as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
+                return {"ok": True, "apps": apps, "resolving": resolving}
 
             def _switch_target(self, package, pattern):
                 """调用采集器注入的 apply_target 回调执行热切换。"""
