@@ -3,17 +3,15 @@ setlocal
 title PerfDog-CN Collector
 cd /d "%~dp0collector"
 
-rem --- locate uv (PATH first, fallback to Cherry Studio bundled) ---
+rem --- locate uv (PATH only; no private-path fallback, portable on any machine) ---
 set "UV=uv"
 where uv >nul 2>nul
 if errorlevel 1 (
-  if exist "C:\Users\SparkGame\.cherrystudio\bin\uv.exe" (
-    set "UV=C:\Users\SparkGame\.cherrystudio\bin\uv.exe"
-  ) else (
-    echo [ERROR] uv not found. Please install uv or add it to PATH.
-    pause
-    exit /b 1
-  )
+  echo [ERROR] uv not found in PATH.
+  echo         Install uv:  pip install uv   or   https://docs.astral.sh/uv/
+  echo         Or use system Python directly:  python main.py --web
+  pause
+  exit /b 1
 )
 
 rem --- browser auto-open now handled by main.py itself (waits for server,

@@ -41,7 +41,8 @@ header h1 { font-size: 18px; color: #4fc3f7; font-weight: 600; flex: 0 0 auto; w
   background: #1a2530; color: #cfd8dc;
   border: 1px solid #263545; border-radius: 5px;
   font-size: 12px; padding: 3px 6px; outline: none;
-  max-width: 280px; min-width: 140px;
+  /* v36：固定宽度，根除"左右横跳"——选项由包名变"中文名 (包名)"时宽度不再 140↔280px 振荡 */
+  width: 240px; max-width: 240px; min-width: 240px;
   color-scheme: dark;
 }
 #tb-select:focus { border-color: #4fc3f7; }
@@ -51,6 +52,14 @@ header h1 { font-size: 18px; color: #4fc3f7; font-weight: 600; flex: 0 0 auto; w
   cursor: pointer; font-size: 13px; padding: 2px 8px; line-height: 1.4;
 }
 #tb-refresh:hover { border-color: #4fc3f7; }
+/* 停止采集按钮（v36，打包后改动 P0） */
+#tb-stop {
+  background: #4a1f1f; color: #ef9a9a;
+  border: 1px solid #7a2e2e; border-radius: 5px;
+  cursor: pointer; font-size: 12px; padding: 3px 10px; line-height: 1.4;
+  white-space: nowrap;
+}
+#tb-stop:hover { border-color: #ef5350; background: #5a2525; }
 .tb-msg { font-size: 11px; white-space: nowrap; }
 .tb-msg.pending { color: #ffd54f; }
 .tb-msg.ok { color: #a5d6a7; }

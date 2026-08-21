@@ -39,15 +39,19 @@ class CpuCollector:
         if not pid:
             return {"pid": None, "cpu_total_pct": None, "cpu_proc_pct": None, "error": "no_pid"}
         try:
-            stat = self.adb.shell(["cat", "/proc/stat"]).splitlines()[0]
+            # 合并 adb 往返（2026-08-21）：一次 shell 拿 /proc/stat + /proc/<pid>/stat，
+            # 替代原来的两次 cat（每秒省一次 shell 往返，约 20–40ms）
+            out = self.adb.shell(["sh", "-c",
+                                  f"cat /proc/stat; echo __PDSEP__; cat /proc/{pid}/stat"])
+            part_stat, _, part_pstat = out.partition("__PDSEP__")
+            stat = part_stat.splitlines()[0]
             fields = [int(x) for x in stat.split()[1:]]
             idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
             total = sum(fields)
             busy = total - idle
 
-            pstat = self.adb.shell(["cat", f"/proc/{pid}/stat"])
             # 进程名可能含空格/括号，用最后一个 ')' 切分，其后字段从 state 开始
-            after = pstat[pstat.rfind(")") + 1:].split()
+            after = part_pstat[part_pstat.rfind(")") + 1:].split()
             utime = int(after[11])  # 原字段 14
             stime = int(after[12])  # 原字段 15
             proc_jiffies = utime + stime

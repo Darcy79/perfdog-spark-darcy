@@ -4,6 +4,23 @@
 
 > 📖 **指标详解与使用说明**见同目录 `指标说明.md`（FPS/Jank/帧时间/CPU/PSS 与 PerfDog Memory 区别/网络/温度等逐项说明 + 异常排查 + 测试场景建议）。
 
+## 获取
+
+**方式 A：下载打包版（推荐，免装 Python）**
+1. 打开 GitHub Release 页：https://github.com/Darcy79/perfdog-spark-darcy/releases
+2. 下载最新版 `perfdog.exe`（GitHub Actions 自动构建的单文件，Windows 直接双击运行）
+3. exe 首次运行自动把配置模板复制到 exe 所在目录（可改 `config.json`），数据保存在 exe 旁 `output/` 下
+
+**方式 B：源码运行**
+```bash
+git clone https://github.com/Darcy79/perfdog-spark-darcy.git
+cd perfdog-spark-darcy
+# 双击 start_perfdog.bat（自动用 uv 跑，无需装 Python）；或：
+cd collector && uv run --no-project python main.py --web
+```
+
+> 两种方式行为一致：等价 `cd collector && python main.py --web`。打包版与源码版每次 Release 同步更新。
+
 ## 一键启动（不用记命令）
 
 | 文件 | 作用 |
@@ -189,10 +206,10 @@ python main.py --package com.example.game --process-pattern "" --web
 |---|---|
 | `ts` / `t_ms` | Unix 秒 / 相对启动毫秒（对齐埋点时间轴） |
 | `fps.fps` | 帧率；`jank_rate` = 卡顿帧占比；`frame_p50/p95/max_ms` = 帧时间分布（卡顿定位关键）；`refresh_hz` = 屏幕刷新率 |
-| `cpu.cpu_total_pct` | 整机 CPU 占用%；`cpu_proc_pct` = 目标进程 CPU（单核折算） |
-| `mem.pss_kb` / `vmrss_kb` | PSS 内存（与 PerfDog 同口径）/ RSS 驻留内存 |
-| `net.rx_kbps` / `tx_kbps` | 目标进程下行/上行速率 |
-| `therm.temp_c` / `current_ma` / `voltage_v` / `power_w` | 电池温度 / 电流 / 电压 / 功率（机型无权限时为 null） |
+| `cpu.cpu_total_pct` | 整机 CPU 占用%；`cpu_proc_pct` = 目标进程 CPU（**单核折算，多核满载可 >100%**） |
+| `mem.pss_kb` / `vmrss_kb` | PSS 内存（与 PerfDog 同口径）/ RSS 驻留内存（同源解析，恒满足 RSS ≥ PSS） |
+| `net.rx_kbps` / `tx_kbps` | **整机网络流量（除 lo）**，非进程级（免 root 免 profileable 方案的固有口径，PerfDog 官方免 root 同理） |
+| `therm.temp_c` / `current_ma` / `voltage_v` / `power_w` | 电池温度 / 电流 / 电压 / 功率（**温度是电池温度 ≠ SoC 温度**；机型无权限时为 null） |
 
 > 完整指标口径详解见 `指标说明.md`。
 

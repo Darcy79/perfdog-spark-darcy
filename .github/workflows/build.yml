@@ -1,0 +1,59 @@
+name: Build Windows exe
+
+# 构建单文件 perfdog.exe（仅构建期依赖 PyInstaller，运行时保持纯标准库）。
+# 触发：推送 v* tag（自动发 Release）/ 手动 workflow_dispatch。
+# 用法：git tag v1.1.0 && git push origin v1.1.0 → Actions 自动出 exe Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare staging (copy collector sources)
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force packaging/staging/collector -ErrorAction SilentlyContinue
+          Copy-Item -Recurse collector packaging/staging/collector
+          Get-ChildItem packaging/staging/collector -Recurse -Filter __pycache__ |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem packaging/staging/collector -Recurse -Filter *.pyc |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+
+      - name: Build exe (build-time only dependencies)
+        shell: pwsh
+        run: |
+          pip install pyinstaller
+          pyinstaller perfdog.spec --clean --noconfirm
+
+      - name: Smoke test (py_compile all staged sources)
+        shell: pwsh
+        run: |
+          python -m py_compile `
+            collector\main.py collector\web.py collector\adb.py `
+            collector\pidresolver.py collector\apk_label.py collector\logcat.py `
+            collector\export_report.py collector\dashboard.py `
+            collector\metrics\fps.py collector\metrics\cpu.py `
+            collector\metrics\mem.py collector\metrics\network.py `
+            collector\metrics\thermal.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perfdog-windows
+          path: dist/perfdog.exe
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/perfdog.exe
+          generate_release_notes: true

@@ -63,6 +63,7 @@ class LogcatMonitor:
         self._events = []               # 待消费事件（加锁）
         self._lock = threading.Lock()
         self._anchor = None             # 采集启动时设备 epoch（秒）
+        self._anchor_year = None        # 锚点对应年份（logcat 时间戳无年份，补锚点年）
         self._last_emit = {}            # (tag, text) -> 最近发送时间，限流
         self.started = False
 
@@ -75,6 +76,8 @@ class LogcatMonitor:
             self._anchor = float(out.strip())
         except Exception:
             self._anchor = time.time()
+        # logcat 行时间戳无年份字段，取锚点年（跨 12/31 采集不会错一年，2026-08-21 修复）
+        self._anchor_year = datetime.fromtimestamp(self._anchor).year
         cmd = [self._adb.adb]
         if self._serial:
             cmd += ["-s", self._serial]
@@ -160,10 +163,13 @@ class LogcatMonitor:
             return None
 
         # 时间对齐：logcat 时间戳 → 设备 epoch → 相对锚点的 t_ms
+        # 年份取锚点年（设备时钟与电脑可能不同年，datetime.now().year 会错一年）
         t_ms = None
         try:
+            year = self._anchor_year if self._anchor_year is not None \
+                else datetime.now().year
             dt = datetime.strptime(
-                f"{datetime.now().year}-{date_s} {hmss}",
+                f"{year}-{date_s} {hmss}",
                 "%Y-%m-%d %H:%M:%S.%f")
             t_ms = (dt.timestamp() - self._anchor) * 1000
             if t_ms < 0:
@@ -178,6 +184,9 @@ class LogcatMonitor:
         if now - last < self._min_gap:
             return None
         self._last_emit[key] = now
+        # 限流字典定期裁剪：长采集大量唯一文本会缓慢膨胀（2026-08-21 修复）
+        if len(self._last_emit) > 500:
+            self._last_emit.clear()
 
         return {"t_ms": t_ms, "tag": tag, "level": level, "text": text}
 

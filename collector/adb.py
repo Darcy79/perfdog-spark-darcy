@@ -87,6 +87,18 @@ class Adb:
                 return
         raise AdbError("未找到处于 device 状态的设备（有 device 前缀设备但未授权，请在手机上允许 USB 调试）。")
 
+    def is_device_alive(self):
+        """探活：设备是否仍在线（连续采样失败时的断连诊断用，2026-08-21）。"""
+        try:
+            out = self._run(["devices"])
+            for l in out.splitlines():
+                parts = l.split()
+                if len(parts) >= 2 and parts[0] == self.serial and parts[1] == "device":
+                    return True
+        except Exception:
+            pass
+        return False
+
     def shell(self, args):
         """执行 adb shell 命令，返回 stdout 文本。
 

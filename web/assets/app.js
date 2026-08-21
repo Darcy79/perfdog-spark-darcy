@@ -679,13 +679,15 @@
   function renderAll(charts, rows, opts) {
     var zoom = !!(opts && opts.zoom);
     if (!rows.length) return;
-    // 无数据指标自动隐藏对应卡片
-    var fpsVisible = hasData(rows, function (r) { return r.fps && r.fps.fps; });
-    var frameVisible = hasData(rows, function (r) { return r.fps && r.fps.frame_p95_ms; });
-    var cpuVisible = hasData(rows, function (r) { return r.cpu && r.cpu.cpu_total_pct; });
-    var memVisible = hasData(rows, function (r) { return r.mem && r.mem.pss_kb; });
-    var netVisible = hasData(rows, function (r) { return r.net && r.net.rx_kbps; });
-    var tempVisible = hasData(rows, function (r) { return r.therm && r.therm.temp_c; });
+    // 无数据指标自动隐藏对应卡片。
+    // hasData 用 typeof number 判断（合法 0 值——静止 FPS/空载 CPU——不会隐藏卡片；
+    // 2026-08-21 复核：getter 显式返回 null 代替 && 短路，语义等价且更清晰）
+    var fpsVisible = hasData(rows, function (r) { return r.fps ? r.fps.fps : null; });
+    var frameVisible = hasData(rows, function (r) { return r.fps ? r.fps.frame_p95_ms : null; });
+    var cpuVisible = hasData(rows, function (r) { return r.cpu ? r.cpu.cpu_total_pct : null; });
+    var memVisible = hasData(rows, function (r) { return r.mem ? r.mem.pss_kb : null; });
+    var netVisible = hasData(rows, function (r) { return r.net ? r.net.rx_kbps : null; });
+    var tempVisible = hasData(rows, function (r) { return r.therm ? r.therm.temp_c : null; });
 
     setCardVisible('chart-fps', fpsVisible);
     setCardVisible('chart-frametime', frameVisible);
@@ -773,11 +775,30 @@
   function renderEvents(charts, rows, events) {
     if (!events || !events.length || !rows || !rows.length) return;
     var MAX_EV = 200;
+    // v36 修复：类目轴值是采样点时间（rows 的 t_ms 递增，多为整数秒），事件时刻
+    // （如 10.4s）未必命中类目 → 此前 Math.round(ev.t_ms/100)/10 映射的类目在
+    // ECharts 类目轴中找不到对应值会静默不渲染（大部分事件线丢失）。
+    // 改为二分找最近采样点，保证标注线一定落在曲线窗口内。
+    var times = rows.map(function (r) { return r.t_ms; });
+    function nearestCat(ms) {
+      if (ms == null || !times.length) return null;
+      if (ms <= times[0]) return Math.round(times[0] / 100) / 10;
+      if (ms >= times[times.length - 1]) return Math.round(times[times.length - 1] / 100) / 10;
+      var lo = 0, hi = times.length - 1;
+      while (lo < hi - 1) {
+        var mid = (lo + hi) >> 1;
+        if (times[mid] <= ms) lo = mid; else hi = mid;
+      }
+      return (ms - times[lo] <= times[hi] - ms)
+        ? Math.round(times[lo] / 100) / 10
+        : Math.round(times[hi] / 100) / 10;
+    }
     var markers = [];
     events.forEach(function (ev) {
       if (markers.length >= MAX_EV) return;
       if (!ev || ev.t_ms == null) return;
-      var cat = Math.round(ev.t_ms / 100) / 10;   // 与 timeAxis 格式一致
+      var cat = nearestCat(ev.t_ms);
+      if (cat === null) return;
       var isErr = ev.level === 'E' || ev.level === 'F';
       markers.push({
         xAxis: cat,

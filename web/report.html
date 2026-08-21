@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=35">
+<link rel="stylesheet" href="/assets/style.css?v=36">
 </head>
 <body>
 <header>
@@ -64,17 +64,26 @@
 
 <footer><span>自研 PerfDog · 报告数据来自本地 output/*.jsonl，不传云端</span></footer>
 
-<script src="/assets/echarts.min.js?v=35"></script>
-<script src="/assets/app.js?v=35"></script>
+<script src="/assets/echarts.min.js?v=36"></script>
+<script src="/assets/app.js?v=36"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
   var selected = null;
   var allRuns = [];
+  var lastRunsSig = null;   // 历史列表变化签名（v36：无变化时不重建 DOM，避免每 5s 轮询闪动）
 
   function loadRuns() {
     fetch('/api/runs').then(function (r) { return r.json(); }).then(function (runs) {
-      allRuns = runs || [];
+      var next = runs || [];
+      // 变化检测（v36）：按 name+points+size+mtime+remark 组签名，无变化直接跳过
+      // 重建——保留滚动位置与选中态，历史列表真正"无感刷新"
+      var sig = next.map(function (x) {
+        return x.name + '|' + x.points + '|' + x.size_kb + '|' + x.mtime + '|' + (x.remark || '');
+      }).join('\n');
+      if (sig === lastRunsSig) return;
+      lastRunsSig = sig;
+      allRuns = next;
       renderRuns();
     }).catch(function () {});
   }

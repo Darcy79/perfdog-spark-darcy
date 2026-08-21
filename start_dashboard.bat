@@ -6,13 +6,11 @@ cd /d "%~dp0collector"
 set "UV=uv"
 where uv >nul 2>nul
 if errorlevel 1 (
-  if exist "C:\Users\SparkGame\.cherrystudio\bin\uv.exe" (
-    set "UV=C:\Users\SparkGame\.cherrystudio\bin\uv.exe"
-  ) else (
-    echo [ERROR] uv not found. Please install uv or add it to PATH.
-    pause
-    exit /b 1
-  )
+  echo [ERROR] uv not found in PATH.
+  echo         Install uv:  pip install uv   or   https://docs.astral.sh/uv/
+  echo         Or use system Python directly:  python dashboard.py
+  pause
+  exit /b 1
 )
 
 start "" http://localhost:8080/report.html

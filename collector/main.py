@@ -130,6 +130,12 @@ def main():
             monitor = None
             print(f"[!] logcat 监听启动失败（不影响性能采集）: {e}")
 
+    # 停止标志：Ctrl+C / 看板"停止采集"按钮（POST /api/stop）共用同一路径
+    # （复用首次 Ctrl+C 的完整停止逻辑：退采样循环 → 停 logcat → 生成报告 → running=False）
+    stop = {"flag": False}
+    # 看板"退出程序"（POST /api/shutdown）：停止采集后跳过"看板仍在运行"等待，直接结束进程
+    shutdown_req = {"flag": False}
+
     # 可选：实时 Web 看板
     web = None
     if args.web:
@@ -214,7 +220,21 @@ def main():
 
         web.set_switch_callback(_apply_target)
 
-    stop = {"flag": False}
+        # ---- 看板停止采集 / 退出程序 回调（2026-08-21 打包后改动 P0） ----
+        def _stop_capture():
+            """看板 POST /api/stop：复用首次 Ctrl+C 的停止路径（stop.flag=True）。"""
+            stop["flag"] = True
+            # 联动中止后台 label 解析（避免解析线程空转）
+            web.abort_label_resolve()
+            print("[>] 已从看板收到停止采集请求", flush=True)
+
+        def _shutdown_all():
+            """看板 POST /api/shutdown：停止采集并让程序走完停止流程后自然退出。"""
+            _stop_capture()
+            shutdown_req["flag"] = True
+
+        web.set_stop_callback(_stop_capture)
+        web.set_shutdown_callback(_shutdown_all)
 
     def _handler(sig, frame):
         if stop["flag"]:
@@ -256,6 +276,9 @@ def main():
 
     start = time.time()
     n = 0
+    # 设备断连诊断（2026-08-21）：连续 N 轮多数指标报错 → 探活 adb devices 醒目告警
+    fail_streak = 0
+    diag_shown = False
     with open(out_file, "w", encoding="utf-8") as f:
         while not stop["flag"]:
             ts = time.time()
@@ -267,6 +290,29 @@ def main():
                 for k in SAMPLER_INTERVALS:
                     if k in latest:
                         row[k] = latest[k]
+
+            # 断连监测：本轮多数指标带 error → 累计；恢复后清零
+            err_count = sum(1 for k in SAMPLER_INTERVALS
+                            if isinstance(row.get(k), dict) and row[k].get("error"))
+            if err_count >= len(SAMPLER_INTERVALS) - 1:
+                fail_streak += 1
+                if fail_streak >= 10 and not diag_shown:
+                    diag_shown = True
+                    if adb.is_device_alive():
+                        print("[!] 连续采样失败但设备在线：请确认目标应用在前台/渲染层存在", flush=True)
+                        if web:
+                            web.set_status(running=False)
+                    else:
+                        print("[!] 检测到设备断连！请检查 USB 连接（采集线程持续重试，恢复后自动继续）", flush=True)
+                        if web:
+                            web.set_status(running=False, device="断连")
+            else:
+                fail_streak = 0
+                if diag_shown:
+                    diag_shown = False
+                    if web:
+                        web.set_status(running=True, device=adb.serial)
+
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
             n += 1
@@ -331,6 +377,11 @@ def main():
 
     if web:
         web.set_status(running=False)
+        if shutdown_req["flag"]:
+            # 看板"退出程序"：停止流程已走完（含 HTML 报告生成），直接结束进程
+            print("[*] 已收到看板退出请求，程序退出。")
+            web.stop()
+            return
         print(f"[*] Web 看板仍在运行（可查看刚采集的数据与历史报告）:")
         print(f"[*]   实时看板/历史: http://localhost:{web.port}")
         print(f"[*]   历史报告页: http://localhost:{web.port}/report.html")

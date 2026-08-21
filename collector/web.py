@@ -8,10 +8,15 @@ web.add_sample(row)，页面通过轮询 /api/latest 实时刷新。
     GET /                    实时看板页
     GET /report.html         历史报告页
     GET /assets/*            静态文件（echarts.min.js / app.js / style.css）
-    GET /api/status          采集状态 {running, device, pid, run_id, outdir}
+    GET /api/status          采集状态 {running, device, pid, run_id, outdir, ...}
     GET /api/latest          最近采样点（环形缓冲，最多 300 点）
-    GET /api/runs            output 目录历史 jsonl 列表
-    GET /api/report?name=xx  指定历史报告完整数据（JSON 数组）
+    GET /api/runs            output 目录历史 jsonl 列表（行数按 mtime/size 缓存）
+    GET /api/report?name=xx  指定历史报告完整数据（JSON 数组，按 mtime 缓存）
+    GET /api/events?name=xx  logcat 事件标注列表
+    POST /api/stop           停止采集（复用首次 Ctrl+C 的完整停止路径）
+    POST /api/shutdown       彻底退出程序（停止采集 + 结束进程）
+    POST /api/switch-target  热切换被测应用
+    POST /api/rename         记录备注/重命名
 """
 
 import json
@@ -45,10 +50,14 @@ class WebServer:
         self._seq = 0               # 采样序号：SSE 用它作增量游标（替代 count）
         self.status = {"running": False, "device": "", "pid": None,
                        "run_id": "", "started_at": None,
-                       "target": None, "process_pattern": ""}
+                       "target": None, "process_pattern": "",
+                       "outdir": os.path.abspath(output_dir)}
         self.adb = adb              # 采集器注入的 adb 实例（离线看板为 None）
         self.switch_cb = switch_cb  # 采集器注入的热切换回调 apply_target(package, pattern)
+        self._stop_cb = None        # 采集器注入的停止采集回调（复用 Ctrl+C 停止路径）
+        self._shutdown_cb = None    # 采集器注入的彻底退出回调（停止采集 + 结束进程）
         self._resolving = False     # 后台应用名(label)解析进行中
+        self._abort_label = threading.Event()  # 中止后台 label 解析（停止采集时置位）
         self._lock = threading.Lock()
         self._httpd = None
         self._thread = None
@@ -61,6 +70,13 @@ class WebServer:
         self._labels_file_lock = threading.Lock()
         # 失败缓存的随机抖动（0~1h）：防止大量包在同一时刻到期引发解析风暴
         self._label_retry_jitter = random.uniform(0, 3600)
+        # /api/runs 行数缓存：{rel: (mtime_ns, size, n)}，历史文件不可变，
+        # 只对 (mtime,size) 变化的文件重算行数（2026-08-21，output 27MB 不再每次全读）
+        self._runs_lines = {}
+        # /api/report 解析缓存：{name: (mtime_ns, size, rows)}，历史 jsonl 不可变
+        self._report_cache = {}
+        # report 缓存上限：超过则整体清空重建（简单防膨胀）
+        self._report_cache_max = 50
 
     # ---------------- 采集器调用 ----------------
     def add_sample(self, row):
@@ -79,6 +95,20 @@ class WebServer:
         """注入热切换回调（main.py 传入 apply_target）。"""
         with self._lock:
             self.switch_cb = cb
+
+    def set_stop_callback(self, cb):
+        """注入停止采集回调（main.py 传入，复用首次 Ctrl+C 的完整停止路径）。"""
+        with self._lock:
+            self._stop_cb = cb
+
+    def set_shutdown_callback(self, cb):
+        """注入彻底退出回调（停止采集 + 结束进程）。"""
+        with self._lock:
+            self._shutdown_cb = cb
+
+    def abort_label_resolve(self):
+        """请求中止后台 label 解析（停止采集时调用，避免解析线程空转）。"""
+        self._abort_label.set()
 
     def clear_latest(self):
         """清空实时缓冲（切换被测目标后新目标从零开始显示）。"""
@@ -202,6 +232,10 @@ class WebServer:
         aapt = self._find_aapt()
         try:
             for pkg, apk in todo:
+                # 中止标志：看板停止采集时终止剩余解析（2026-08-21）
+                if self._abort_label.is_set():
+                    print("[-] label 解析已中止（采集停止）", flush=True)
+                    break
                 # 已解析成功 / 失败未到重试期 → 跳过（防止重复昂贵解析）
                 if not self._need_resolve(labels.get(pkg)):
                     continue
@@ -356,6 +390,39 @@ class WebServer:
                         "ok": ok, "message": msg if ok else None,
                         "error": msg if not ok else None,
                     }, ensure_ascii=False))
+                elif parsed.path == "/api/stop":
+                    # 看板"停止采集"按钮：复用首次 Ctrl+C 的完整停止路径
+                    # （退采样循环 → 停 logcat → 生成 HTML 报告 → running=False）
+                    cb = server._stop_cb
+                    if cb:
+                        try:
+                            cb()
+                            self._send(200, json.dumps(
+                                {"ok": True, "message": "停止采集请求已发出"},
+                                ensure_ascii=False))
+                        except Exception as e:
+                            self._send(200, json.dumps(
+                                {"ok": False, "error": str(e)}, ensure_ascii=False))
+                    else:
+                        self._send(200, json.dumps(
+                            {"ok": False, "error": "未运行采集器"},
+                            ensure_ascii=False))
+                elif parsed.path == "/api/shutdown":
+                    # 看板彻底退出：停止采集 + 结束进程（停止流程走完后程序自然退出）
+                    cb = server._shutdown_cb
+                    if cb:
+                        try:
+                            cb()
+                            self._send(200, json.dumps(
+                                {"ok": True, "message": "程序即将退出"},
+                                ensure_ascii=False))
+                        except Exception as e:
+                            self._send(200, json.dumps(
+                                {"ok": False, "error": str(e)}, ensure_ascii=False))
+                    else:
+                        self._send(200, json.dumps(
+                            {"ok": False, "error": "未运行采集器"},
+                            ensure_ascii=False))
                 else:
                     self._send(404, json.dumps({"error": "not found"}))
 
@@ -510,35 +577,68 @@ class WebServer:
                     return False, str(e)
 
             def _list_runs(self):
-                """递归扫描 output 下所有 jsonl（含按时间命名的子文件夹），最新在前。"""
-                out = []
+                """递归扫描 output 下所有 jsonl（含按时间命名的子文件夹），最新在前。
+
+                行数按 (mtime_ns, size) 缓存（2026-08-21）：历史 jsonl 采集结束后不可变，
+                只对变化的文件重算行数——此前每次请求全量 open 计数，output 积累
+                37 文件 27MB 时 report.html 每 5s 轮询就要全读一遍 27MB。
+                """
                 base = os.path.realpath(server.output_dir)
+                # 第一遍：收集文件集合与 stat（不读内容）
+                files = []
                 if os.path.isdir(base):
-                    for root, _, files in os.walk(base):
-                        for fn in files:
+                    for root, _, names in os.walk(base):
+                        for fn in names:
                             if not fn.endswith(".jsonl"):
                                 continue
                             fp = os.path.join(root, fn)
                             rel = os.path.relpath(fp, base).replace("\\", "/")
                             try:
                                 st = os.stat(fp)
-                                n = sum(1 for _ in open(fp, encoding="utf-8"))
                             except Exception:
                                 continue
-                            remark = ""
-                            rp = fp + ".remark.txt"
-                            if os.path.isfile(rp):
-                                try:
-                                    remark = open(rp, encoding="utf-8").read().strip()
-                                except Exception:
-                                    pass
-                            out.append({
-                                "name": rel,
-                                "size_kb": round(st.st_size / 1024, 1),
-                                "points": n,
-                                "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                                "remark": remark,
-                            })
+                            files.append((rel, st.st_mtime_ns, st.st_size))
+                # 清理已不存在文件的缓存
+                alive = {rel for rel, _, _ in files}
+                for rel in [r for r in server._runs_lines if r not in alive]:
+                    server._runs_lines.pop(rel, None)
+                # 只对 (mtime,size) 变化的文件重算行数
+                for rel, mtime_ns, size in files:
+                    entry = server._runs_lines.get(rel)
+                    if entry and entry[0] == mtime_ns and entry[1] == size:
+                        continue
+                    fp = os.path.join(base, rel.replace("/", os.sep))
+                    try:
+                        n = sum(1 for _ in open(fp, encoding="utf-8"))
+                    except Exception:
+                        continue
+                    try:
+                        st = os.stat(fp)
+                        server._runs_lines[rel] = (st.st_mtime_ns, st.st_size, n)
+                    except Exception:
+                        server._runs_lines[rel] = (mtime_ns, size, n)
+                # 组响应
+                out = []
+                for rel, mtime_ns, size in files:
+                    entry = server._runs_lines.get(rel)
+                    if not entry:
+                        continue
+                    _, _, n = entry
+                    fp = os.path.join(base, rel.replace("/", os.sep))
+                    remark = ""
+                    rp = fp + ".remark.txt"
+                    if os.path.isfile(rp):
+                        try:
+                            remark = open(rp, encoding="utf-8").read().strip()
+                        except Exception:
+                            pass
+                    out.append({
+                        "name": rel,
+                        "size_kb": round(size / 1024, 1),
+                        "points": n,
+                        "mtime": datetime.fromtimestamp(mtime_ns / 1e9).strftime("%Y-%m-%d %H:%M:%S"),
+                        "remark": remark,
+                    })
                 out.sort(key=lambda x: x["mtime"], reverse=True)
                 return out
 
@@ -575,14 +675,26 @@ class WebServer:
                 if not fp.startswith(base + os.sep):
                     return {"error": "bad path"}
                 try:
+                    st = os.stat(fp)
+                except Exception:
+                    return {"error": "no such file"}
+                # 按 (mtime_ns, size) 缓存解析结果（2026-08-21）：历史 jsonl 不可变，
+                # 反复点开同一报告不再全文读 + JSON 解析（1MB jsonl ~50ms → 0）
+                entry = server._report_cache.get(name)
+                if entry and entry[0] == st.st_mtime_ns and entry[1] == st.st_size:
+                    return entry[2]
+                try:
                     rows = []
                     with open(fp, encoding="utf-8") as f:
                         for line in f:
                             line = line.strip()
                             if line:
                                 rows.append(json.loads(line))
-                    return rows
                 except Exception as e:
                     return {"error": str(e)}
+                server._report_cache[name] = (st.st_mtime_ns, st.st_size, rows)
+                if len(server._report_cache) > server._report_cache_max:
+                    server._report_cache.clear()
+                return rows
 
         return Handler

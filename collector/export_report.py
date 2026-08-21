@@ -109,7 +109,10 @@ def export_html(rows, out_path, events=None):
     if events is None:
         events = []
         try:
-            ev_path = out_path.replace(".html", ".events.jsonl")
+            # 用 removesuffix 语义拼接：out_path 中若含其他 ".html" 段（如目录名）
+            # replace(".html", ...) 会错替换，只剥末尾 5 字符（2026-08-21 修复）
+            ev_path = (out_path[:-len(".html")] + ".events.jsonl") \
+                if out_path.endswith(".html") else out_path + ".events.jsonl"
             with open(ev_path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()

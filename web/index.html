@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 实时看板</title>
-<link rel="stylesheet" href="/assets/style.css?v=35">
+<link rel="stylesheet" href="/assets/style.css?v=36">
 </head>
 <body>
 <header>
@@ -13,12 +13,14 @@
     <label for="tb-select" class="tb-label">被测应用</label>
     <select id="tb-select" title="切换被测目标（微信小游戏 / 已安装 App / 自定义包名）"></select>
     <button id="tb-refresh" type="button" title="刷新已安装应用列表">↻</button>
+    <button id="tb-stop" type="button" class="stop-btn" title="停止采集并生成报告">⏹ 停止采集</button>
     <span id="tb-status"></span>
   </div>
   <div id="status-bar">
     <span id="st-device">设备: -</span>
     <span id="st-pid">进程: -</span>
     <span id="st-run">本次: -</span>
+    <span id="st-outdir" title="本次采集数据保存目录">数据: -</span>
     <span id="st-state" class="st-pill idle">未采集</span>
     <span id="st-elapsed">时长: 0s</span>
   </div>
@@ -56,8 +58,8 @@
   <span>自研 PerfDog · 数据仅存本地（output/*.jsonl）· <a href="/report.html">历史报告 →</a></span>
 </footer>
 
-<script src="/assets/echarts.min.js?v=35"></script>
-<script src="/assets/app.js?v=35"></script>
+<script src="/assets/echarts.min.js?v=36"></script>
+<script src="/assets/app.js?v=36"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -124,6 +126,8 @@
       document.getElementById('st-device').textContent = '设备: ' + (s.device || '-');
       document.getElementById('st-pid').textContent = '进程: ' + (s.pid || '-');
       document.getElementById('st-run').textContent = '本次: ' + (s.run_id || '-');
+      // 数据目录常驻显示（打包后改动 P0：用户随时知道数据存哪）
+      document.getElementById('st-outdir').textContent = '数据: ' + (s.outdir || '-');
       var pill = document.getElementById('st-state');
       if (s.running) {
         pill.className = 'st-pill running';
@@ -144,12 +148,22 @@
     }).catch(function () {});
   }
 
-  // ---------------- 被测应用下拉（方案 A 2026-08-20） ----------------
+  // ---------------- 被测应用下拉（方案 A 2026-08-20 / v36 就地 diff 更新） ----------------
   function initTarget() {
     // 刷新按钮显式传 force=1：服务端包列表有 60s TTL 缓存，
     // 手动刷新必须绕过缓存才能真正重新扫描（2026-08-21）
     document.getElementById('tb-refresh').onclick = function () { loadApps(true); };
     document.getElementById('tb-select').onchange = onTargetSelect;
+    // 看板"停止采集"按钮（打包后改动 P0）：POST /api/stop 复用 Ctrl+C 停止路径
+    document.getElementById('tb-stop').onclick = function () {
+      var st = document.getElementById('tb-status');
+      st.textContent = '⏹ 停止请求已发出…';
+      st.className = 'tb-msg pending';
+      fetch('/api/stop', { method: 'POST' }).then(function (r) { return r.json(); }).then(function (d) {
+        st.textContent = d && d.ok ? '✔ 已停止' : '✘ ' + ((d && d.error) || '停止失败');
+        st.className = d && d.ok ? 'tb-msg ok' : 'tb-msg err';
+      }).catch(function () { st.textContent = '✘ 请求失败'; st.className = 'tb-msg err'; });
+    };
     loadApps();       // 加载已装应用列表（构建下拉选项）
     loadTarget();     // 回显当前目标
   }
@@ -163,12 +177,17 @@
     }).catch(function () {});
   }
 
+  var appListOld = null;   // 上次应用列表快照（就地 diff 用，v36）
+
   function loadApps(force) {
     var sel = document.getElementById('tb-select');
     var st = document.getElementById('tb-status');
-    sel.innerHTML = '<option value="">加载中…</option>';
-    st.textContent = '加载应用列表…';
-    st.className = 'tb-msg pending';
+    // v36 无感刷新：轮询/解析刷新不再清空下拉重建（这是"左右横跳"主因），
+    // 只对变化的选项做就地 diff；仅首次/手动刷新显示提示
+    if (appListOld === null || force) {
+      st.textContent = force ? '刷新应用列表…' : '加载应用列表…';
+      st.className = 'tb-msg pending';
+    }
     // force=true（仅刷新按钮传入）→ ?force=1 绕过服务端 60s 包列表缓存
     fetch('/api/device-apps' + (force ? '?force=1' : '')).then(function (r) { return r.json(); }).then(function (d) {
       appList = (d && d.apps) || [];
@@ -180,38 +199,93 @@
         clearTimeout(loadApps._timer);
         loadApps._timer = setTimeout(loadApps, 3000);
       } else if (d && d.ok) {
-        st.textContent = '';
-        st.className = 'tb-msg';
+        if (appListOld === null || force) { st.textContent = ''; st.className = 'tb-msg'; }
+        else if (st.className === 'tb-msg pending' || st.className === 'tb-msg warn') { st.textContent = ''; st.className = 'tb-msg'; }
       } else {
         st.textContent = '⚠ ' + (d && d.error || '无设备');
         st.className = 'tb-msg warn';
       }
     }).catch(function () {
-      rebuildSelect();
+      if (appListOld === null) rebuildSelect();
       st.textContent = '⚠ 应用列表加载失败';
       st.className = 'tb-msg warn';
     });
   }
 
+  // 选项显示文本："中文名 (包名)" 或 包名
+  function optText(a) {
+    var label = (a && a.label) || (a && a.pkg) || '';
+    return (label !== a.pkg) ? label + ' (' + a.pkg + ')' : label;
+  }
+
+  function ensureInstalledGroup(sel) {
+    // 找"已安装应用"组；无则创建（首次全量重建时调用）
+    for (var i = 0; i < sel.children.length; i++) {
+      var c = sel.children[i];
+      if (c.tagName === 'OPTGROUP' && c.label.indexOf('已安装') >= 0) return c;
+    }
+    var g = document.createElement('optgroup');
+    g.label = '已安装应用（点选即测）';
+    var customOpt = sel.querySelector('option[value="__custom__"]');
+    if (customOpt) sel.insertBefore(g, customOpt);
+    else sel.appendChild(g);
+    return g;
+  }
+
   function rebuildSelect() {
     var sel = document.getElementById('tb-select');
-    var html = '';
-    html += '<optgroup label="预设">';
-    html += '<option value="mm">微信小游戏 (com.tencent.mm)</option>';
-    html += '</optgroup>';
-    if (appList.length) {
-      html += '<optgroup label="已安装应用（点选即测）">';
-      for (var i = 0; i < appList.length; i++) {
-        var a = appList[i];
-        var label = (a && a.label) || (a && a.pkg) || '';
-        // 有中文名（label≠包名）→ 显示 "中文名 (包名)"，否则只显示包名
-        var disp = (label !== a.pkg) ? label + ' (' + a.pkg + ')' : label;
-        html += '<option value="' + esc(a.pkg) + '">' + esc(disp) + '</option>';
-      }
+    if (appListOld === null) {
+      // 首次：全量构建（预设组 + 已安装组 + 自定义项）
+      var html = '';
+      html += '<optgroup label="预设">';
+      html += '<option value="mm">微信小游戏 (com.tencent.mm)</option>';
       html += '</optgroup>';
+      sel.innerHTML = html;
+      var g = ensureInstalledGroup(sel);
+      for (var i = 0; i < appList.length; i++) {
+        var o = document.createElement('option');
+        o.value = appList[i].pkg;
+        o.setAttribute('data-pkg', appList[i].pkg);
+        o.textContent = optText(appList[i]);
+        g.appendChild(o);
+      }
+      var co = document.createElement('option');
+      co.value = '__custom__';
+      co.textContent = '自定义包名…';
+      sel.appendChild(co);
+    } else {
+      // 就地 diff（v36）：只增删改变化的选项，DOM 与选中态保持稳定
+      var group = ensureInstalledGroup(sel);
+      var newMap = {};
+      for (var i = 0; i < appList.length; i++) newMap[appList[i].pkg] = appList[i];
+      var opts = group.querySelectorAll('option[data-pkg]');
+      var seen = {};
+      for (var i = 0; i < opts.length; i++) {
+        var o = opts[i];
+        var p = o.getAttribute('data-pkg');
+        if (!newMap[p]) { o.remove(); continue; }       // 消失项删除
+        seen[p] = true;
+        var t = optText(newMap[p]);
+        if (o.textContent !== t) o.textContent = t;     // label 变化项更新文本
+      }
+      // 新增项按 pkg 字典序插入正确位置
+      var pkgs = Object.keys(newMap).filter(function (p) { return !seen[p]; }).sort();
+      for (var i = 0; i < pkgs.length; i++) {
+        var no = document.createElement('option');
+        no.value = pkgs[i];
+        no.setAttribute('data-pkg', pkgs[i]);
+        no.textContent = optText(newMap[pkgs[i]]);
+        var inserted = false;
+        for (var j = 0; j < group.children.length; j++) {
+          var op = group.children[j];
+          if (op.tagName === 'OPTION' && (op.getAttribute('data-pkg') || '') > pkgs[i]) {
+            group.insertBefore(no, op); inserted = true; break;
+          }
+        }
+        if (!inserted) group.appendChild(no);
+      }
     }
-    html += '<option value="__custom__">自定义包名…</option>';
-    sel.innerHTML = html;
+    appListOld = appList.slice();
     updateSelectValue();
   }
 

@@ -88,7 +88,17 @@ class ThermalCollector:
                     vol = dv * 1000         # mV -> uV
 
         if temp is not None:
-            result["temp_c"] = round(temp / 10, 1)        # -> °C
+            result["temp_c"] = round(temp / 10, 1)        # 0.1°C -> °C
+            # 物理范围校验（2026-08-21）：电池温度不可能 >60°C。实测部分机型/状态
+            # dumpsys 温度单位是 0.01°C（毫摄氏度），无条件 /10 会产出 370°C 脏数据
+            # 污染整条曲线 → 超过 60°C 按 0.01°C 口径重算一次，仍异常则置 None 记 error
+            if result["temp_c"] > 60:
+                alt = round(temp / 100, 1)      # 按 0.01°C/单位 重算
+                if alt <= 60:
+                    result["temp_c"] = alt
+                else:
+                    result["temp_c"] = None
+                    result["error"] = "temperature_out_of_range"
         if cur is not None:
             result["current_ma"] = round(abs(cur) / 1000, 1)
         if vol is not None:

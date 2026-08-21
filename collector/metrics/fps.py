@@ -17,11 +17,13 @@
      INT64_MAX (9223372036854775807)，必须过滤，否则 span 会算出天文数字
   4) FPS = (帧数-1) ÷ (首末帧时间戳跨度) —— 基于缓冲内时间戳直接算，
      对滚动缓冲/满槽稳定（增量法在缓冲满时会恒 0）
-  5) 新鲜度：比较缓冲最新帧时间戳与系统 uptime，若最新帧距今过久
-     （>1.5s）说明游戏暂停/静止画面未提交新帧 → FPS 归零
-     （不需要 --latency-clear，避免 clear 后窗口内无帧导致的间歇性 0）
+  5) 新鲜度：比较缓冲最新帧时间戳是否推进——持续渲染则单调前移，静止/暂停不变
+     → FPS 归零（不需要 --latency-clear，避免 clear 后窗口内无帧导致的间歇性 0）
   6) Jank 率 = 相邻帧间隔 > 2×刷新周期 的占比（PerfDog 同口径，
      随刷新率自适应：60Hz→33.3ms、90Hz→22.2ms、120Hz→16.7ms）
+  7) 百分位/Jank 只算本次新增帧（2026-08-21）：128 槽缓冲 ~2.13s 数据窗 > 0.5s 采样
+     间隔，若对全缓冲 gaps 计算，一次 2–3.6s 的卡死帧会留缓冲 30–60s，期间每个采样点
+     的 P95/Max/Jank 被重复污染 → 只对 ts > 上次缓冲最大时间戳的新增帧算 gaps
 
 容错冗余（2026-08-12 自查优化）：
   - 游戏不在前台 → 渲染层销毁 → 报 no_layer，5s 节流重试 --list
@@ -29,6 +31,7 @@
   - 0 帧/静止 = 游戏确实没在渲染，是合法结果，不误换层
 """
 
+import math
 import re
 
 # 层不存在时，两次 --list 重试的最小间隔（秒）
@@ -40,8 +43,6 @@ DEFAULT_REFRESH_NS = 16_666_666
 # 缓冲内有效时间戳上限（ns，>3 年视为哨兵/异常值）：
 # 实测荣耀设备缓冲末位常驻 INT64_MAX 哨兵
 MAX_VALID_TS = 10 ** 17
-# 最新帧超过该时间（ns）无新提交 → 判定游戏静止/暂停，FPS 归零
-STALE_NS = 1_500_000_000
 
 
 class FpsCollector:
@@ -55,6 +56,8 @@ class FpsCollector:
         self.refresh_ns = DEFAULT_REFRESH_NS
         self._next_resolve = 0.0
         self._last_max_ts = None   # 上次缓冲最新帧时间戳（用于静止判断）
+        self._last_seen_ts = None  # 上次缓冲最大有效帧时间戳（用于"只算新帧"）
+        self._last_frame_stats = None  # 最近一次由新帧算出的帧时间分布（无新帧时沿用）
         # FPS 双通道（2026-08-13 扩展支持任意 App）：
         #   sf  = SurfaceFlinger --latency（微信小游戏 SurfaceView 层）
         #   gfx = dumpsys gfxinfo 增量（普通 View 应用——SF 窗口层无帧统计）
@@ -306,17 +309,30 @@ class FpsCollector:
                 result["stale"] = True
         self._last_max_ts = cur_max
 
-        # Jank 率：相邻帧间隔超过 2×刷新周期
+        # Jank 率 / 帧时间百分位：只对本次新增帧计算（2026-08-21 修复缓冲残留污染）。
+        # 新增帧 = ts > 上次缓冲最大时间戳 的条目；首轮（_last_seen_ts=None）取全缓冲。
+        # FPS 值仍用全缓冲 span（保持滚动缓冲下的稳定性，不受此影响）。
+        new_ts = timestamps if self._last_seen_ts is None \
+            else [t for t in timestamps if t > self._last_seen_ts]
+        if timestamps:
+            self._last_seen_ts = timestamps[-1]
         jank_threshold = self.refresh_ns * JANK_MULTIPLIER
-        if n >= 2:
-            gaps = [timestamps[i] - timestamps[i - 1] for i in range(1, n)]
+        if len(new_ts) >= 2:
+            gaps = [new_ts[i] - new_ts[i - 1] for i in range(1, len(new_ts))]
             over = sum(1 for g in gaps if g > jank_threshold)
-            result["jank_rate"] = round(over / (n - 1), 4)
-            # 帧时间分布（ms）：P50 / P95 / Max（P95 用最接近分位的排序值）
+            result["jank_rate"] = round(over / (len(new_ts) - 1), 4)
+            # 帧时间分布（ms）：P50 / P95 / Max。P95 用 ceil(n*0.95)-1 取排序值，
+            # 与前端统计栏口径统一（此前后端 int(n*0.95) 差一位次）
             sorted_gaps = sorted(gaps)
             g_ms = lambda v: round(v / 1e6, 2)
-            result["frame_p50_ms"] = g_ms(sorted_gaps[(len(sorted_gaps) - 1) // 2])
-            result["frame_p95_ms"] = g_ms(sorted_gaps[min(int(len(sorted_gaps) * 0.95), len(sorted_gaps) - 1)])
-            result["frame_max_ms"] = g_ms(sorted_gaps[-1])
+            idx95 = min(max(int(math.ceil(len(sorted_gaps) * 0.95)) - 1, 0), len(sorted_gaps) - 1)
+            self._last_frame_stats = {
+                "frame_p50_ms": g_ms(sorted_gaps[(len(sorted_gaps) - 1) // 2]),
+                "frame_p95_ms": g_ms(sorted_gaps[idx95]),
+                "frame_max_ms": g_ms(sorted_gaps[-1]),
+            }
+        if self._last_frame_stats is not None:
+            # 无新帧（静止）或新帧不足 2 个 → 沿用最近一次新帧统计，曲线连续不跳变
+            result.update(self._last_frame_stats)
 
         return result
