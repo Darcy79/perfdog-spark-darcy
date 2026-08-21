@@ -17,6 +17,7 @@ import signal
 import sys
 import threading
 import time
+import webbrowser
 from datetime import datetime
 
 from adb import Adb, AdbError
@@ -58,6 +59,8 @@ def main():
     ap.add_argument("--output", default="output", help="输出目录")
     ap.add_argument("--web", action="store_true", help="启动实时 Web 看板")
     ap.add_argument("--port", type=int, default=8080, help="Web 看板端口（默认 8080）")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="启动看板后不自动打开浏览器（无头/CI 场景用）")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -133,7 +136,28 @@ def main():
         from web import WebServer
         web = WebServer(port=args.port, output_dir=outdir, adb=adb)
         port = web.start()
-        print(f"[+] Web 看板已启动: http://localhost:{port}  （实时看板 / | 历史报告 /report.html）")
+        # 启动指引（exe 版没有 bat 的说明文字，关键信息必须在这里讲清楚）：
+        # 看板地址 / 历史报告地址 / 数据目录绝对路径 / 如何停止
+        print("")
+        print("=" * 60)
+        print("  PerfDog-CN 实时看板已启动")
+        open_hint = "（即将自动打开浏览器）" if not args.no_browser else ""
+        print(f"  实时看板  : http://localhost:{port}  {open_hint}".rstrip())
+        print(f"  历史报告  : http://localhost:{port}/report.html")
+        print(f"  数据目录  : {os.path.abspath(outdir)}")
+        print("  停止方式  : 本窗口按 Ctrl+C 一次停采集，再按一次退出")
+        print("=" * 60)
+        print("")
+        if not args.no_browser:
+            # 延迟打开：等服务线程就绪（start() 已绑定端口，稍等更稳妥）
+            def _open_browser():
+                time.sleep(1.5)
+                try:
+                    webbrowser.open(f"http://localhost:{port}")
+                except Exception:
+                    pass
+            threading.Thread(target=_open_browser, daemon=True,
+                             name="open-browser").start()
         web.set_status(running=True, device=adb.serial, pid=pid, run_id=run_id,
                        target=package, process_pattern=process_pattern,
                        started_at=datetime.now().strftime("%H:%M:%S"))

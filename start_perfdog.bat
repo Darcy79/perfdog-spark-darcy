@@ -16,8 +16,8 @@ if errorlevel 1 (
   )
 )
 
-rem --- open browser (refresh after the server is up) ---
-start "" http://localhost:8080
+rem --- browser auto-open now handled by main.py itself (waits for server,
+rem     avoids opening a tab before the service is up / duplicate tabs) ---
 
 echo.
 echo ==================================================

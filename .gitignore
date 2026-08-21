@@ -17,6 +17,8 @@ build/
 dist/
 *.spec
 packaging/staging/
+# Inno Setup 安装包产物
+packaging/installer_output/
 
 # 其它
 *.log

@@ -3,6 +3,10 @@
 #   onefile (default): single exe, everything bundled (best for sharing, download & run)
 #   onedir: thin exe + external collector source (dev mode, hot-update source without rebuild)
 # Usage: pwsh -ExecutionPolicy Bypass -File build_exe.ps1 [-Mode onefile|onedir]
+#
+# Installer (Setup.exe) build — one command does PyInstaller + Inno Setup:
+#   pwsh -ExecutionPolicy Bypass -File build_installer.ps1 [-IsccPath "..."]
+# Inno Setup 6.x download: https://jrsoftware.org/isdl.php (free)
 param([ValidateSet("onefile", "onedir")][string]$Mode = "onefile")
 
 $ErrorActionPreference = "Stop"
