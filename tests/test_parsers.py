@@ -141,6 +141,32 @@ App Summary
         self.assertEqual(d.get("pss_kb"), 1234)
         self.assertEqual(d.get("rss_kb"), 5678)
 
+    def test_meminfo_real_honor_format_with_inner_blank_line(self):
+        # 荣耀 ADT-AN00 (Android 14) 真实输出（2026-08-24 抓取）：
+        # App Summary 段内 "Unknown:" 与 "TOTAL PSS:" 之间有空行——
+        # 旧版按"段内第一个空行截断"会切掉 TOTAL 行导致 PSS 全空（v36 回归 bug）
+        out = """\
+App Summary
+                       Pss(KB)                        Rss(KB)
+                        ------                         ------
+           Java Heap:   103968                         128400
+         Native Heap:    88760                          93584
+                Code:    54972                         227108
+               Stack:     5088                           5244
+            Graphics:     9224                           9228
+       Private Other:    96764
+              System:   165259
+             Unknown:                                  106748
+ 
+           TOTAL PSS:   524035            TOTAL RSS:   570312       TOTAL SWAP PSS:   130050
+ 
+ Objects
+"""
+        d = parse_meminfo(out)
+        self.assertEqual(d.get("pss_kb"), 524035)
+        self.assertEqual(d.get("rss_kb"), 570312)
+        self.assertGreaterEqual(d["rss_kb"], d["pss_kb"])
+
 
 class TestCpuMergedCommand(unittest.TestCase):
     """cpu 合并 adb 往返后的解析（P2-7）。"""

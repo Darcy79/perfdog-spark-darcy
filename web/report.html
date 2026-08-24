@@ -155,7 +155,9 @@
 
   function selectRun(name) {
     selected = name;
-    loadRuns();
+    // v36 修复：loadRuns 有签名检测（无变化直接 return），点击记录后列表高亮不会
+    // 更新 → 这里直接重绘列表（数据未变，仅 selected 高亮变化），避免"点了没反应"
+    if (allRuns.length) renderRuns();
     fetch('/api/report?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); })
       .then(function (rows) {
         if (!Array.isArray(rows) || !rows.length) {

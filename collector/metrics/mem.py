@@ -46,25 +46,18 @@ def parse_smaps_rollup(out):
 
 
 def parse_meminfo(out):
-    """解析 dumpsys meminfo 输出（App Summary 段同源 PSS/RSS）。
+    """解析 dumpsys meminfo 输出中的 TOTAL PSS / TOTAL RSS（大小写不敏感，全输出搜索）。
 
     返回 {"pss_kb":.., "rss_kb":..}（能拿到的字段），失败返回空 dict。
+
+    ⚠️ 2026-08-24 真机回归：荣耀 ADT-AN00 (Android 14) 的 App Summary 段内存在空行
+    （"Unknown:" 与 "TOTAL PSS:" 之间），旧版按"段内第一个空行截断"会切掉 TOTAL 行，
+    导致 v36 起 PSS 全空。改为全输出搜索——与 v35 实测有效的行为一致，同时大小写不敏感
+    并补 TOTAL RSS（同源双值）。
     """
     res = {}
-    # 优先在 App Summary 段内匹配（锚定段起点，避免命中主表/其它段落）
-    seg = out
-    mseg = re.search(r"App Summary", out, re.IGNORECASE)
-    if mseg:
-        seg = out[mseg.end():]
-        # 跳过段标题后的空行/空白，从内容行开始
-        body = re.search(r"\S", seg)
-        if body:
-            seg = seg[body.start():]
-            mend = re.search(r"\n\s*\n", seg)   # 数字区结束：下一个空行
-            if mend:
-                seg = seg[:mend.start()]
-    mp = _TOTAL_PSS_RE.search(seg)
-    mr = _TOTAL_RSS_RE.search(seg)
+    mp = _TOTAL_PSS_RE.search(out)
+    mr = _TOTAL_RSS_RE.search(out)
     if mp:
         res["pss_kb"] = _kb(mp.group(1))
     if mr:
