@@ -25,6 +25,7 @@ class CpuCollector:
         self._last_total = None
         self._last_proc = None
         self._last_ts = None
+        self._last_pid = None   # 上次采样的进程（重启换 pid 后重置，防跨进程差值）
 
     def _probe_clk_tck(self):
         try:
@@ -59,15 +60,22 @@ class CpuCollector:
             return {"pid": pid, "cpu_total_pct": None, "cpu_proc_pct": None, "error": "read_fail"}
 
         result = {"pid": pid, "cpu_total_pct": None, "cpu_proc_pct": None}
+        # 进程重启（pid 变化）：进程级差值基线失效——旧进程 jiffies 与新进程相减
+        # 无意义，且 dt 横跨了进程死亡期（2026-08-24 评估复核补齐）。
+        # 整机基线保留（/proc/stat 与进程无关，可跨重启继续算）。
+        if self._last_pid is not None and self._last_pid != pid:
+            self._last_proc = None
+        self._last_pid = pid
         if self._last_busy is not None and self._last_ts is not None:
             dt = ts - self._last_ts
             if dt > 0:
                 dcpu = total - self._last_total
                 dbusy = busy - self._last_busy
-                dproc = proc_jiffies - self._last_proc
                 if dcpu > 0:
                     result["cpu_total_pct"] = round(dbusy / dcpu * 100, 2)
-                if dproc >= 0:
-                    result["cpu_proc_pct"] = round(dproc / self.clk_tck / dt * 100, 2)
+                if self._last_proc is not None:
+                    dproc = proc_jiffies - self._last_proc
+                    if dproc >= 0:
+                        result["cpu_proc_pct"] = round(dproc / self.clk_tck / dt * 100, 2)
         self._last_busy, self._last_total, self._last_proc, self._last_ts = busy, total, proc_jiffies, ts
         return result

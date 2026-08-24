@@ -205,6 +205,43 @@ class TestCpuMergedCommand(unittest.TestCase):
         self.assertEqual(len([c for c in adb.calls if "__PDSEP__" in " ".join(c)]), 2)
 
 
+    def test_process_restart_resets_proc_baseline(self):
+        """进程重启（pid 变化）后进程%基线重置：首个样本为 None，不跨进程相减。
+
+        评估报告低优先级项（2026-08-24 补齐）：旧实现用旧进程 jiffies 减新进程，
+        且 dt 横跨进程死亡期，重启后首个进程%严重失真。
+        """
+        adb = MockAdb({})
+        # 三次采样：/proc/stat 递增（整机%可算），进程在第二次采样时重启换 pid
+        seq = [
+            "cpu  100 0 50 850 0 0 0 0 0 0\n"  # total=1000 busy=150
+            "__PDSEP__" + "100 (oldproc) S 1 2 3 4 5 6 7 8 9 10 11 500 500 0 0\n",
+            "cpu  120 0 70 910 0 0 0 0 0 0\n"  # total=1100 busy=190
+            "__PDSEP__" + "200 (newproc) S 1 2 3 4 5 6 7 8 9 10 11 30 30 0 0\n",
+            "cpu  140 0 90 970 0 0 0 0 0 0\n"  # total=1200 busy=230
+            "__PDSEP__" + "200 (newproc) S 1 2 3 4 5 6 7 8 9 10 11 30 30 0 0\n",
+        ]
+        calls = {"n": 0}
+
+        def _shell(args):
+            out = seq[min(calls["n"], len(seq) - 1)]
+            calls["n"] += 1
+            return out
+
+        adb.shell = _shell
+        resolver = MockResolver(100)
+        c = CpuCollector(adb, resolver, clk_tck=100)
+        r1 = c.sample(100.0)
+        self.assertIsNone(r1["cpu_proc_pct"])      # 首轮基线
+        resolver.pid = 200                          # 进程重启，pid 变化
+        r2 = c.sample(101.0)
+        self.assertIsNone(r2["cpu_proc_pct"])      # 基线重置，不跨进程相减
+        self.assertIsNotNone(r2["cpu_total_pct"])  # 整机基线保留（与进程无关）
+        r3 = c.sample(102.0)
+        self.assertEqual(r3["cpu_proc_pct"], 0.0)  # 新基线后 jiffies 未变 → 增量 0
+        self.assertEqual(c._last_pid, 200)
+
+
 class TestThermalValidation(unittest.TestCase):
     """温度物理范围校验（P0-2）：0.01°C 口径重算 / 异常置 None。"""
 
