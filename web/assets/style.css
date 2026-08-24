@@ -199,6 +199,22 @@ footer a { color: #4fc3f7; text-decoration: none; }
   display: flex; align-items: center; justify-content: center;
   height: 60vh; color: #546e7a; font-size: 14px;
 }
+
+/* 报告区加载动画（2026-08-24）：切换记录时覆盖旧报告区，纯 CSS 实现。
+   高度与 .placeholder 一致（60vh），首次加载不会比占位提示矮一截 */
+.report-loading {
+  display: flex; align-items: center; justify-content: center;
+  height: 60vh; background: #10151c;
+}
+.report-loading-box { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.report-loading-spinner {
+  width: 36px; height: 36px; border-radius: 50%;
+  border: 3px solid rgba(79, 195, 247, .18);
+  border-top-color: #4fc3f7;
+  animation: report-loading-spin .8s linear infinite;
+}
+.report-loading-text { font-size: 13px; color: #90a4ae; }
+@keyframes report-loading-spin { to { transform: rotate(360deg); } }
 .report-meta {
   font-size: 13px; color: #90a4ae; margin-bottom: 12px; padding: 8px 12px;
   background: #16212c; border: 1px solid #263545; border-radius: 6px;
