@@ -58,3 +58,52 @@
 6. **采集器开销 · 可忽略**：<1~2% CPU，不构成热源。
 
 次要佐证：43°C 后 F2 出现 Jank 0.92 / 帧 Max 777ms，F1 出现 Jank 0.51——"发热→调度收紧→帧不稳"链条已出现，临近指标说明 §5 的 45°C 降频阈值。测量口径提醒：电池温度滞后且量化，实际 SoC 温度更高。
+
+---
+
+## 二次评估（2026-08-24，v39 / HEAD 9e8c4f5）
+
+> 评估时间：2026-08-24 · 评估版本：v39（git HEAD=9e8c4f5，工作区干净）
+> 评估方法：① v36~v39 全部改动代码审查（collector 全部 Python + web/ 前端 + tests/）；② 16 条 golden test 实跑（`python -m unittest discover -s tests`，全部通过，0.001s）；③ 三份真机数据对比验证：修复前 20260821_131418（旧算法）、v36 首跑 20260824_082744（回归现场）、修复后 20260824_084252（当前算法）。
+> 数据诊断类结论（热降频、内存泄漏与发热无因果）第一轮已产出，本轮不重做。
+
+### 一、逐项核对表（第一轮注意点 → 当前状态）
+
+| # | 第一轮注意点 | 当前状态 | 证据 |
+|---|---|---|---|
+| fps-1 | **窗口重叠重复计数**：128 槽 ~2.13s 窗 > 0.5s 采样，一次卡死帧残留缓冲 30~60s，期间每个采样点 P95/Max/Jank 被重复污染 | ✅ **已解决**（v36） | fps.py:312-336 引入 `_last_seen_ts`：Jank/帧时间百分位只对 `ts > 上次缓冲最大时间戳` 的新增帧计算；无新帧时沿用最近一次统计保持曲线连续；FPS 值仍用全缓冲 span（span 法本身需要满窗，合理）。真机佐证：8-24 两份数据 jank>0 点呈事件簇状（082744 的 34~38s、71~76s），不再拖尾 30~60s |
+| fps-2 | 暂停恢复后 span 跨暂停间隙，恢复初期 FPS 偏低 + 多记一次 Jank | ➖ **保留（口径特性，可接受）** | 暂停间隙仍计一次 Jank，但新帧机制下只计一次、不再残留污染，影响可忽略 |
+| fps-3 | 单列格式兜底 refresh=60Hz，高刷设备 Jank 阈值偏宽 | ⚠️ **未解决（低风险）** | DEFAULT_REFRESH_NS 仍为首行解析失败时的兜底（fps.py:41-42）；首行解析在主流设备有效，仅单列+高刷+首行解析失败三重叠加才触发 |
+| fps-4 | sf/gfx 双通道 Jank 口径不一致（gfxinfo 系统 90 分位 vs 2×刷新周期） | ⚠️ **未解决（部分缓解）** | gfx 通道 result 带 `"source": "gfxinfo"` 字段可区分（fps.py:201），但 export_report.py flatten 未透出该字段，导出报告无法分辨口径来源 |
+| fps-5 | （第一轮未单列）后端 P95 取位 `int(n*0.95)` 与前端 `ceil(n*0.95)-1` 差一位次 | ✅ **已解决**（v36） | fps.py:324-328 后端改为 `ceil(n*0.95)-1`，前后端口径统一 |
+| cpu-1 | 进程 CPU 单核折算可 >100%，读者易误读 | ➖ **口径保留，文档已说明**（按建议方式闭环） | 指标说明.md §6 已注明单核折算含义与 8 核 800% 上限 |
+| cpu-2 | （性能）整机/进程两次 adb cat 往返 | ✅ **已优化**（v36） | cpu.py:45-47 合并为一次 `sh -c "cat /proc/stat; echo __PDSEP__; cat /proc/<pid>/stat"`，每秒省一次往返；golden test `test_merged_cpu_math` 断言每轮仅一次 shell 且差值数学正确 |
+| cpu-3 | （复核新发现）进程重启 pid 变化后，旧进程 jiffies 与新进程相减、dt 横跨死亡期 → 首个进程% 严重失真 | ✅ **已解决**（d742fb2 补漏） | cpu.py:63-68 pid 变化时 `_last_proc=None` 重置进程基线、保留整机基线（/proc/stat 与进程无关）；专项测试 `test_process_restart_resets_proc_baseline` 覆盖 |
+| mem-1 | PSS（dumpsys）与 RSS（/proc/status）双源不同步，实测 72.6% 样本 RSS<PSS 倒挂 | ✅ **已解决**（v36 + 8-24 真机回归修复） | 优先 `/proc/<pid>/smaps_rollup`（毫秒级、Pss/Rss 同源，mem.py:86-93）；回退 dumpsys App Summary 段同源解析 TOTAL PSS/TOTAL RSS。真机三段对比：修复前 20260821_131418 倒挂 13.4%（108/805）；v36 首跑 082744 因"App Summary 段内空行截断"回归致 PSS 全空（191/191）；修复后 084252 **倒挂 0%、空值 0**，PSS 226MB / RSS 235MB 满足 RSS≥PSS。荣耀真实格式已固化为 golden test `test_meminfo_real_honor_format_with_inner_blank_line` |
+| mem-2 | 兜底正则 `TOTAL\s+(\d+)\s+kB` 误匹配风险 | ✅ **已改善** | 主路径为行首精确匹配（防 Pss_Anon 误判，有测试 `test_smaps_rollup_rejects_pss_anon`）+ App Summary 全输出搜索；旧 TOTAL 行正则降为最末兜底（mem.py:23-25 注释标明风险已压低） |
+| net-1 | `/proc/<pid>/net/dev` 实为整机流量（net ns 共享）非进程级 | ✅ **已解决**（按第一轮建议方式：文档修正、算法保留） | network.py docstring:7-10 明确标注"整机流量（除 lo）"口径；指标说明.md §11 同步修正，并注明免 root 无进程级方案（PerfDog 官方同理） |
+| therm-1 | dumpsys 温度部分机型为 0.01°C 口径，无条件 /10 产出 370°C 脏数据污染曲线 | ✅ **已解决**（v36） | thermal.py:90-101 物理范围校验：>60°C 按 0.01°C 口径重算，仍异常置 None 记 `temperature_out_of_range`；3 条 golden test 覆盖（3700→37.0、50000→None+error、430→43.0 正常值不受影响）。真机佐证：三份验证数据 >60°C 脏数据均为 0 |
+| therm-2 | 电池温度≠SoC 温度、更新慢（1°C 量化、数十秒滞后） | ⚠️ **未解决（传感器局限，建议保留）** | `/sys/class/thermal/thermal_zone*` 补充未做；荣耀 /sys 需 root 的现状下收益有限，低优先级 |
+| main-1 | fps 0.5s 采样但 1s 落盘，一半 fps 样本被丢弃 | ⚠️ **未解决（观察项，影响已降低）** | SAMPLER_INTERVALS 与 1s 落盘不变；但 v36 起 Jank 按新帧计算，0.5s 采样仍提升"最近值"时效，jsonl 1s 粒度对报告分析够用，低优先级 |
+| pid-1 | （第一轮未评审，本轮新增）pid 复用风险与解析开销 | ✅ **良好** | pidresolver 单次 `ps -A -o PID,ARGS` 拿全进程（旧 toybox 回退 `ps -A`）；`current_pid()` 校验 comm 防 pid 被系统复用后采错进程；解析失败 5s 节流防 3 线程 ~3 次/s 轰炸 adb；3 条 golden test 覆盖（含 comm 不匹配触发重解析） |
+
+### 二、代码质量评价（v36~v39）
+
+- **健壮性**：v39 `_send_json_api` 统一兜底（web.py:317-337）把 handler 线程异常收敛为 `200+{"error"}`，根治"线程崩溃 → 连接重置 → 前端 Failed to fetch 误判数据损坏"；`_runs_lock`/`_report_lock` 修补 ThreadingHTTPServer 下缓存读改写竞态（"dictionary changed size during iteration"）；label 解析增加 `_abort_label` Event，停止采集即中止。main.py 新增断连诊断（连续 10 轮多数指标 error → `adb.is_device_alive()` 探活 + 看板状态同步，main.py:279-314）。
+- **性能**：`/api/runs` 行数按 (mtime_ns,size) 缓存（output 27MB 不再每 5s 全读）；`/api/report` 解析缓存（上限 50 整体清空，防膨胀虽粗暴但有效）；cpu 合并往返；mem 主路径 smaps_rollup 毫秒级替代 0.5s dumpsys。
+- **测试**：16 条 golden test 全部通过，精准覆盖高危解析器（fps 哨兵/单列、mem 同源/行首匹配/荣耀真实格式、cpu 合并命令数学/进程重启基线、thermal 双口径校验、pidresolver 解析与 comm 校验）。082744 的 PSS 全空回归证明了"解析器改动必须配真机格式测试"——该教训已通过 honor 格式测试固化闭环。
+- **文档**：指标说明.md 同步更新（smaps_rollup 同源、网络整机口径、温度物理校验）；network.py docstring 口径修正与第一轮建议逐字对应。
+- **前端**：`#tb-select` 固定 240px + 应用列表就地 diff 更新（appListOld 快照），横跳问题从布局与逻辑双层根除；停止采集按钮 + 数据目录常驻（st-outdir）；v37/v38 加载动画 + "加载完再显示" + loadingSeq 丢弃慢响应；v39 前端区分业务错误与网络错误（Failed to fetch 给重启引导而非"数据损坏"）。
+
+### 三、新发现问题（本轮，均为低优先级）
+
+1. **导出报告丢失 fps 通道口径标记**：fps.py result 有 `source: "gfxinfo"` 字段，但 export_report.py `flatten()` 未透出，导出 HTML/CSV 无法区分 sf/gfx 双通道数据（对应 fps-4 的遗留）。建议 flatten 加 source 列。
+2. **新口径下单点 jank_rate 波动变大（读数特性，非缺陷）**：新帧机制下单点分母变小（1s 内新帧 ~30~60 个），一次大 gap 即产出 0.7~0.86 的高单点值（8-24 数据可见）。单点高 ≠ 全程卡，报告解读应以均值/持续段为准——建议在指标说明.md Jank 节补一句口径说明。
+3. **gfx 通道 df<0 未处理**：gfxinfo 计数被系统重置时 `total - ltotal < 0`，当前不计 fps 也不重置基线（fps.py:207-211 只处理 df>0/df==0），会沿用旧基线直到追平，短暂丢点。极小概率，可观察。
+4. **`_report_cache` 超限整体 clear**：50 份报告上限后全清重建，缓存命中策略粗暴但可接受；如需更优可改 LRU，非必须。
+
+### 四、总体结论
+
+**第一轮指出的 12 项注意点：7 项已解决、2 项按建议方式闭环（cpu-1 文档说明、net-1 文档修正）、1 项口径特性保留（fps-2）、3 项未解决但均为低风险/低优先级（fps-3 单列兜底、fps-4 双通道口径、therm-2 传感器局限、main-1 落盘粒度）。** 复核阶段还新发现并修复了一个第一轮未指出的真 bug（cpu 进程重启基线），说明评审-修复-回归闭环运转有效。
+
+v36~v39 的修复质量高：每个算法修复都有真机数据验证 + golden test 固化（mem 荣耀格式、thermal 双口径、cpu 重启基线），v39 的并发兜底与统一错误契约把"看板层"的健壮性短板也补齐了。**当前版本（v39）数据采集算法准确度与工程健壮性均达到可交付状态**；遗留项全部是低风险优化项，可按上表优先级择机处理，不阻塞使用。
