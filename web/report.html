@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=38">
+<link rel="stylesheet" href="/assets/style.css?v=39">
 </head>
 <body>
 <header>
@@ -64,8 +64,8 @@
 
 <footer><span>自研 PerfDog · 报告数据来自本地 output/*.jsonl，不传云端</span></footer>
 
-<script src="/assets/echarts.min.js?v=38"></script>
-<script src="/assets/app.js?v=38"></script>
+<script src="/assets/echarts.min.js?v=39"></script>
+<script src="/assets/app.js?v=39"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -177,6 +177,12 @@
     fetch('/api/report?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); })
       .then(function (rows) {
         if (seq !== loadingSeq) return;   // 已有更新的加载，丢弃慢响应
+        // 业务层错误：服务端返回 {"error": ...}（bad name/路径/文件缺失等），单独提示
+        if (rows && !Array.isArray(rows) && rows.error) {
+          setPlaceholder(PH_DEFAULT, true);
+          alert('读取失败: ' + rows.error);
+          return;
+        }
         if (!Array.isArray(rows) || !rows.length) {
           setPlaceholder(PH_DEFAULT, true);
           alert('读取失败或文件为空');
@@ -224,8 +230,15 @@
             }
           }).catch(function () {});
       }).catch(function (e) {
-        if (seq === loadingSeq) setPlaceholder(PH_DEFAULT, true);
-        alert('读取失败: ' + e);
+        if (seq !== loadingSeq) return;
+        setPlaceholder(PH_DEFAULT, true);
+        // 网络层失败（服务未启动/已关闭/连接被重置）：fetch 抛 TypeError，
+        // 笼统显示 "Failed to fetch" 会让用户误以为数据损坏 → 明确引导重启看板
+        var isNet = e && (e.name === 'TypeError' ||
+                    /Failed to fetch|NetworkError|Load failed/i.test(String(e)));
+        alert(isNet
+          ? '无法连接看板服务（服务可能已关闭或端口变更），请重新启动看板后刷新本页。'
+          : '读取失败: ' + e);
       });
   }
 

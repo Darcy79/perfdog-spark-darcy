@@ -73,10 +73,19 @@ class WebServer:
         # /api/runs 行数缓存：{rel: (mtime_ns, size, n)}，历史文件不可变，
         # 只对 (mtime,size) 变化的文件重算行数（2026-08-21，output 27MB 不再每次全读）
         self._runs_lines = {}
+        # runs 行数缓存互斥锁（2026-08-24）：/api/runs 每 5s 轮询 + 并发打开报告时，
+        # _runs_lines 的读改写若交叉可能触发 "dictionary changed size during iteration"，
+        # 该异常若不兜底会让 handler 线程崩溃 → 连接被重置 → 前端 Failed to fetch
+        self._runs_lock = threading.Lock()
         # /api/report 解析缓存：{name: (mtime_ns, size, rows)}，历史 jsonl 不可变
         self._report_cache = {}
         # report 缓存上限：超过则整体清空重建（简单防膨胀）
         self._report_cache_max = 50
+        # report 缓存互斥锁（2026-08-24）：ThreadingHTTPServer 下 /api/report 并发
+        # 时缓存的 get/set/clear 可能交叉——GIL 只保证单条字节码原子，读改写序列
+        # 不加锁仍可能读到不一致状态；加锁同时让同一报告的并发请求串行命中缓存，
+        # 避免重复全文解析
+        self._report_lock = threading.Lock()
 
     # ---------------- 采集器调用 ----------------
     def add_sample(self, row):
@@ -305,6 +314,28 @@ class WebServer:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def _send_json_api(self, payload_fn):
+                """JSON API 端点统一兜底（2026-08-24）。
+
+                ThreadingHTTPServer 下 handler 线程内任何未捕获异常都会冒泡到
+                socketserver，导致当前连接被直接重置——浏览器 fetch 收到的是
+                `TypeError: Failed to fetch`，用户误以为数据损坏。这里把异常收敛为
+                200 + {"error": ...}（与既有 /api 错误契约一致），保证线程不崩、
+                前端能拿到可读错误。客户端主动断开（BrokenPipe/ConnectionReset）
+                属正常，原样抛给上层默认处理。
+                """
+                try:
+                    payload = payload_fn()
+                    self._send(200, json.dumps(payload, ensure_ascii=False))
+                except (BrokenPipeError, ConnectionResetError):
+                    raise
+                except Exception as e:
+                    try:
+                        self._send(200, json.dumps(
+                            {"error": f"internal error: {e}"}, ensure_ascii=False))
+                    except Exception:
+                        pass  # 响应头/正文可能已部分发出，无法补救，仅保证不崩线程
+
             def do_GET(self):
                 parsed = urlparse(self.path)
                 path = parsed.path
@@ -353,16 +384,17 @@ class WebServer:
                     # SSE 实时推送：采集到新样本即推，毫秒级响应（二期增强 2026-08-14）
                     self._sse(server)
                 elif path == "/api/runs":
-                    self._send(200, json.dumps(self._list_runs(), ensure_ascii=False))
+                    # 统一兜底：内部异常 → 200+{"error"}，不让线程崩溃重置连接
+                    self._send_json_api(self._list_runs)
                 elif path == "/api/report":
                     qs = parse_qs(parsed.query)
                     name = (qs.get("name") or [""])[0]
-                    self._send(200, json.dumps(self._load_report(name), ensure_ascii=False))
+                    self._send_json_api(lambda: self._load_report(name))
                 elif path == "/api/events":
                     # logcat 事件标注（模式1：与报告同目录的 perfdog_xxx.events.jsonl）
                     qs = parse_qs(parsed.query)
                     name = (qs.get("name") or [""])[0]
-                    self._send(200, json.dumps(self._load_events(name), ensure_ascii=False))
+                    self._send_json_api(lambda: self._load_events(name))
                 else:
                     self._send(404, json.dumps({"error": "not found"}))
 
@@ -598,29 +630,33 @@ class WebServer:
                             except Exception:
                                 continue
                             files.append((rel, st.st_mtime_ns, st.st_size))
-                # 清理已不存在文件的缓存
-                alive = {rel for rel, _, _ in files}
-                for rel in [r for r in server._runs_lines if r not in alive]:
-                    server._runs_lines.pop(rel, None)
-                # 只对 (mtime,size) 变化的文件重算行数
-                for rel, mtime_ns, size in files:
-                    entry = server._runs_lines.get(rel)
-                    if entry and entry[0] == mtime_ns and entry[1] == size:
-                        continue
-                    fp = os.path.join(base, rel.replace("/", os.sep))
-                    try:
-                        n = sum(1 for _ in open(fp, encoding="utf-8"))
-                    except Exception:
-                        continue
-                    try:
-                        st = os.stat(fp)
-                        server._runs_lines[rel] = (st.st_mtime_ns, st.st_size, n)
-                    except Exception:
-                        server._runs_lines[rel] = (mtime_ns, size, n)
-                # 组响应
+                # 清理已不存在文件的缓存 + 重算行数：全程持 _runs_lock（2026-08-24），
+                # 并发 /api/runs 请求不再交叉修改 _runs_lines（此前读改写交叉可能触发
+                # "dictionary changed size during iteration" → 线程崩溃 → 连接重置）
+                with server._runs_lock:
+                    alive = {rel for rel, _, _ in files}
+                    for rel in [r for r in server._runs_lines if r not in alive]:
+                        server._runs_lines.pop(rel, None)
+                    # 只对 (mtime,size) 变化的文件重算行数
+                    for rel, mtime_ns, size in files:
+                        entry = server._runs_lines.get(rel)
+                        if entry and entry[0] == mtime_ns and entry[1] == size:
+                            continue
+                        fp = os.path.join(base, rel.replace("/", os.sep))
+                        try:
+                            n = sum(1 for _ in open(fp, encoding="utf-8"))
+                        except Exception:
+                            continue
+                        try:
+                            st = os.stat(fp)
+                            server._runs_lines[rel] = (st.st_mtime_ns, st.st_size, n)
+                        except Exception:
+                            server._runs_lines[rel] = (mtime_ns, size, n)
+                    counts = {rel: server._runs_lines.get(rel) for rel, _, _ in files}
+                # 组响应（用锁外快照，remark 读取等文件 IO 不持锁）
                 out = []
                 for rel, mtime_ns, size in files:
-                    entry = server._runs_lines.get(rel)
+                    entry = counts.get(rel)
                     if not entry:
                         continue
                     _, _, n = entry
@@ -670,6 +706,10 @@ class WebServer:
                 # 允许子目录路径，但做防穿越校验：规范化后必须仍在 output 目录内
                 if not name or not name.endswith(".jsonl"):
                     return {"error": "bad name"}
+                # name 来自 URL query（parse_qs 已解码）：超长/畸形值直接拒绝，
+                # 避免 join/realpath 对极端输入做无意义处理
+                if len(name) > 1024:
+                    return {"error": "bad name"}
                 base = os.path.realpath(server.output_dir)
                 fp = os.path.realpath(os.path.join(base, name))
                 if not fp.startswith(base + os.sep):
@@ -679,22 +719,25 @@ class WebServer:
                 except Exception:
                     return {"error": "no such file"}
                 # 按 (mtime_ns, size) 缓存解析结果（2026-08-21）：历史 jsonl 不可变，
-                # 反复点开同一报告不再全文读 + JSON 解析（1MB jsonl ~50ms → 0）
-                entry = server._report_cache.get(name)
-                if entry and entry[0] == st.st_mtime_ns and entry[1] == st.st_size:
-                    return entry[2]
-                try:
-                    rows = []
-                    with open(fp, encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if line:
-                                rows.append(json.loads(line))
-                except Exception as e:
-                    return {"error": str(e)}
-                server._report_cache[name] = (st.st_mtime_ns, st.st_size, rows)
-                if len(server._report_cache) > server._report_cache_max:
-                    server._report_cache.clear()
-                return rows
+                # 反复点开同一报告不再全文读 + JSON 解析（1MB jsonl ~50ms → 0）。
+                # 缓存读写在 _report_lock 内（2026-08-24）：ThreadingHTTPServer 并发时
+                # 避免 get/set/clear 交叉；同一报告的并发请求串行命中缓存不重复解析。
+                with server._report_lock:
+                    entry = server._report_cache.get(name)
+                    if entry and entry[0] == st.st_mtime_ns and entry[1] == st.st_size:
+                        return entry[2]
+                    try:
+                        rows = []
+                        with open(fp, encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    rows.append(json.loads(line))
+                    except Exception as e:
+                        return {"error": str(e)}
+                    server._report_cache[name] = (st.st_mtime_ns, st.st_size, rows)
+                    if len(server._report_cache) > server._report_cache_max:
+                        server._report_cache.clear()
+                    return rows
 
         return Handler
