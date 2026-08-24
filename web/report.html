@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=37">
+<link rel="stylesheet" href="/assets/style.css?v=38">
 </head>
 <body>
 <header>
@@ -30,13 +30,6 @@
 
   <section class="report-main">
     <div id="report-placeholder" class="placeholder">← 左侧选择一条采集记录查看报告</div>
-    <!-- 报告加载动画：切换记录时 fetch + ECharts 重建期间显示（2026-08-24） -->
-    <div id="report-loading" class="report-loading" style="display:none">
-      <div class="report-loading-box">
-        <div class="report-loading-spinner"></div>
-        <div class="report-loading-text">正在加载报告…</div>
-      </div>
-    </div>
     <div id="report-body" style="display:none">
       <div class="report-meta" id="report-meta"></div>
       <div class="drag-hint">↕ 拖动卡片调整顺序 · 悬停看贯穿线 · 点击锁定贯穿线（再点/双击解锁）· 底部时间条：拖两端<span class="hint-highlight">↔缩放</span> · 拖中间<span class="hint-highlight">=平移</span> · 点空白<span class="hint-highlight">=跳转</span></div>
@@ -71,8 +64,8 @@
 
 <footer><span>自研 PerfDog · 报告数据来自本地 output/*.jsonl，不传云端</span></footer>
 
-<script src="/assets/echarts.min.js?v=37"></script>
-<script src="/assets/app.js?v=37"></script>
+<script src="/assets/echarts.min.js?v=38"></script>
+<script src="/assets/app.js?v=38"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -80,10 +73,15 @@
   var allRuns = [];
   var lastRunsSig = null;   // 历史列表变化签名（v36：无变化时不重建 DOM，避免每 5s 轮询闪动）
   var loadingSeq = 0;       // 报告加载序号：连续快速切换时，慢响应回来不再覆盖新报告
+  // 报告区加载状态（v38 "加载完再显示"：切换期间报告区显示加载文字，渲染完成后一次性显示）
+  var PH_LOADING = '⏳ 正在加载报告…';
+  var PH_DEFAULT = '← 左侧选择一条采集记录查看报告';
 
-  // 报告区加载动画的显示/隐藏（2026-08-24）
-  function showLoading() { document.getElementById('report-loading').style.display = 'flex'; }
-  function hideLoading() { document.getElementById('report-loading').style.display = 'none'; }
+  function setPlaceholder(text, show) {
+    var el = document.getElementById('report-placeholder');
+    el.textContent = text;
+    el.style.display = show ? 'flex' : 'none';
+  }
 
   function loadRuns() {
     fetch('/api/runs').then(function (r) { return r.json(); }).then(function (runs) {
@@ -170,23 +168,22 @@
     // v36 修复：loadRuns 有签名检测（无变化直接 return），点击记录后列表高亮不会
     // 更新 → 这里直接重绘列表（数据未变，仅 selected 高亮变化），避免"点了没反应"
     if (allRuns.length) renderRuns();
-    // 加载动画：从点击到渲染完成期间显示；响应回来时若已有更新的加载（连续快速
-    // 切换）则丢弃本次结果，避免旧数据覆盖新报告
+    // v38 "加载完再显示"：点击立即隐藏旧报告，报告区显示加载文字；
+    // fetch + 渲染全部完成后一次性显示新报告（无覆盖层、无叠加、无位置漂移）。
+    // 连续快速切换时用 loadingSeq 丢弃慢响应，避免旧数据覆盖新报告。
     var seq = ++loadingSeq;
-    showLoading();
-    // 点击即隐藏占位提示（v37 修正：否则首次加载时 placeholder 与 loading 两个
-    // 60vh 块叠加成 120vh，页面多出一屏；fetch 成功分支里的隐藏保留作幂等兜底）
-    document.getElementById('report-placeholder').style.display = 'none';
+    document.getElementById('report-body').style.display = 'none';
+    setPlaceholder(PH_LOADING, true);
     fetch('/api/report?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); })
       .then(function (rows) {
         if (seq !== loadingSeq) return;   // 已有更新的加载，丢弃慢响应
         if (!Array.isArray(rows) || !rows.length) {
-          hideLoading();
+          setPlaceholder(PH_DEFAULT, true);
           alert('读取失败或文件为空');
           return;
         }
-        document.getElementById('report-placeholder').style.display = 'none';
         document.getElementById('report-body').style.display = 'block';
+        setPlaceholder(PH_DEFAULT, false);
         // 被测应用：从每行 target 提取（支持中途热切换显示分界）
         var targets = [];
         var lastT = null;
@@ -219,7 +216,6 @@
         window.PerfCharts.setPinData(rows); // 供点击锁定显示各模块时刻数据
         window.PerfCharts.clearTimeSliders();           // 重建前清旧拖动条
         window.PerfCharts.createTimeSliders(charts, rows); // 自写 PerfDog 风格拖动条
-        hideLoading();   // 主渲染完成；事件标注是异步叠加，不阻塞隐藏
         // 模式1：加载 logcat 事件标注层（场景/console 事件叠加到曲线）
         fetch('/api/events?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); })
           .then(function (events) {
@@ -228,7 +224,7 @@
             }
           }).catch(function () {});
       }).catch(function (e) {
-        if (seq === loadingSeq) hideLoading();
+        if (seq === loadingSeq) setPlaceholder(PH_DEFAULT, true);
         alert('读取失败: ' + e);
       });
   }
