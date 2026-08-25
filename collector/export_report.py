@@ -30,6 +30,7 @@ COLUMNS = [
     ("t_ms", "相对时间ms"), ("fps", "FPS"), ("jank_rate", "Jank率"),
     ("frame_p50_ms", "帧时间P50ms"), ("frame_p95_ms", "帧时间P95ms"),
     ("frame_max_ms", "帧时间Maxms"), ("refresh_hz", "刷新率Hz"),
+    ("fps_source", "FPS通道"),
     ("cpu_total_pct", "CPU整机%"), ("cpu_proc_pct", "CPU进程%"),
     ("pss_mb", "PSS内存MB"), ("rss_mb", "RSS内存MB"),
     ("rx_kbps", "下行KB/s"), ("tx_kbps", "上行KB/s"),
@@ -48,12 +49,29 @@ def load_rows(path):
     return rows
 
 
+def fps_source(f):
+    """判定该采样点的 FPS 采集通道："sf" / "gfxinfo" / ""（无数据或错误）。
+
+    两通道 Jank/帧时间口径不同（sf 按帧间隔 >2×刷新周期，gfxinfo 用系统 Janky 计数），
+    同一次采集中途可能切换 → 导出必须能区分，否则整段数据被当成同一口径解读。
+    gfxinfo 结果自带 source 字段；SF 通道结果没有（不改 jsonl schema，此处按
+    "有层名 + 带 refresh_hz 键" 反推），错误样本（no_layer/read_fail）留空。
+    """
+    if not f:
+        return ""
+    src = f.get("source")
+    if src:
+        return str(src)
+    return "sf" if f.get("layer") and "refresh_hz" in f else ""
+
+
 def flatten(row):
     """将嵌套 jsonl 扁平化为指标字典。"""
     out = {"t_ms": row.get("t_ms")}
     f = row.get("fps") or {}
     out.update({k: f.get(k) for k in ("fps", "jank_rate", "frame_p50_ms", "frame_p95_ms",
                                       "frame_max_ms", "refresh_hz")})
+    out["fps_source"] = fps_source(f)
     c = row.get("cpu") or {}
     out.update({"cpu_total_pct": c.get("cpu_total_pct"), "cpu_proc_pct": c.get("cpu_proc_pct")})
     m = row.get("mem") or {}

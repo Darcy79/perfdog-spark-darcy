@@ -24,6 +24,7 @@ from metrics.mem import parse_smaps_rollup, parse_meminfo
 from metrics.cpu import CpuCollector
 from metrics.thermal import ThermalCollector
 from pidresolver import PidResolver
+from export_report import COLUMNS, flatten
 
 
 class MockAdb:
@@ -79,6 +80,207 @@ class TestFpsLatency(unittest.TestCase):
         refresh, ts = FpsCollector._parse_latency(out)
         self.assertEqual(refresh, 16_666_666)   # 首行解析失败 → 兜底 60Hz
         self.assertEqual(ts, [100, 200])        # 0 被丢弃
+
+
+class SfMockAdb:
+    """SurfaceFlinger 替身：可切换"当前存在的层"与该层的 --latency 输出。
+
+    旧层名再查 --latency 会抛错（真机上层重建后 #id 变化即读取失败），
+    用于驱动 FpsCollector 的层重匹配路径。
+    """
+
+    def __init__(self, layer, latency=""):
+        self.layer = layer          # 设备上当前存在的层（None = 层已销毁）
+        self.latency = latency      # 该层 --latency 输出
+        self.calls = []
+
+    def shell(self, args):
+        self.calls.append(list(args))
+        joined = " ".join(args)
+        if "--list" in joined:
+            return (self.layer or "") + "\n"
+        if "--latency" in joined:
+            if args[-1] != self.layer:
+                raise RuntimeError("layer not found")   # 层已重建/销毁
+            return self.latency
+        raise AssertionError(f"未预期的 adb 调用: {args}")
+
+
+def sf_latency(base_ns, count, step_ns):
+    """构造 --latency 输出（首行刷新周期 + 三列帧时间戳，60Hz）。"""
+    out = "16666666\n"
+    for i in range(count):
+        t = base_ns + i * step_ns
+        out += f"{t}\t{t}\t{t}\n"
+    return out
+
+
+class TestFpsLayerSwitch(unittest.TestCase):
+    """渲染层重建后帧统计不跨层残留（2026-08-25，二次评估 #1）。
+
+    场景：切场景/游戏重启 → SurfaceView 层重建（#id 变化）→ 新层缓冲里新帧不足 2 个
+    时，旧实现会沿用 _last_frame_stats（上一层的 P50/P95/Max）继续上报。
+    """
+
+    L1 = "SurfaceView[com.tencent.mm:appbrand0/com.tencent.mm.appbrand.AppUI]#123(BLAST)"
+    L2 = "SurfaceView[com.tencent.mm:appbrand0/com.tencent.mm.appbrand.AppUI]#456(BLAST)"
+
+    def _collector(self, adb):
+        return FpsCollector(adb, "com.tencent.mm", "appbrand", retry_interval=0.0)
+
+    def test_layer_switch_resets_frame_stats(self):
+        # 旧层：8 帧、帧间隔 100ms（很卡）→ P50/P95/Max 全 100
+        adb = SfMockAdb(self.L1, sf_latency(1_000_000_000_000, 8, 100_000_000))
+        c = self._collector(adb)
+        r1 = c.sample(1.0)
+        self.assertEqual(r1["layer"], self.L1)
+        self.assertEqual(r1["frame_p50_ms"], 100.0)
+
+        # 层重建：#id 变化，新层缓冲此刻只有 1 帧（不足以算帧间隔）
+        adb.layer = self.L2
+        adb.latency = sf_latency(2_000_000_000_000, 1, 16_666_666)
+        r2 = c.sample(2.0)                       # 旧层名读取失败 → 置空 + 重匹配到新层
+        self.assertEqual(r2.get("error"), "layer_read_fail")
+        self.assertEqual(c.layer, self.L2)
+        self.assertIsNone(c._last_frame_stats)   # 基准已随层切换重置
+        self.assertIsNone(c._last_seen_ts)
+        self.assertIsNone(c._last_max_ts)
+
+        r3 = c.sample(3.0)
+        self.assertEqual(r3["total_frames"], 1)
+        # 核心：新层新帧不足 2 个 → 不上报帧时间（修复前会残留旧层的 100.0）
+        self.assertNotIn("frame_p50_ms", r3)
+        self.assertNotIn("frame_p95_ms", r3)
+        self.assertNotIn("frame_max_ms", r3)
+
+        # 新层攒够帧后，统计来自新层自己的帧间隔（16.67ms），与旧层无关
+        adb.latency = sf_latency(2_000_000_000_000, 6, 16_666_666)
+        r4 = c.sample(4.0)
+        self.assertEqual(r4["frame_p50_ms"], 16.67)
+        self.assertEqual(r4["frame_max_ms"], 16.67)
+        self.assertGreater(r4["fps"], 0)
+        self.assertEqual(c.mode, "sf")           # 全程留在 sf 通道
+
+    def test_layer_lost_keeps_sf_channel(self):
+        """回归保护：层暂失时仍保留 sf 通道重匹配，绝不切 gfxinfo。
+
+        （gfxinfo 对 WebGL 恒 0 帧，误切后 FPS 会永久归零）
+        """
+        adb = SfMockAdb(self.L1, sf_latency(1_000_000_000_000, 4, 16_666_666))
+        c = self._collector(adb)
+        c.sample(1.0)
+        self.assertTrue(c._ever_surfaceview)
+
+        adb.layer = None                          # 层销毁（切后台/重建中）
+        r2 = c.sample(2.0)
+        self.assertEqual(r2.get("error"), "layer_read_fail")
+        r3 = c.sample(3.0)
+        self.assertEqual(r3.get("error"), "no_layer")
+        self.assertEqual(r3.get("hint"), "渲染层暂失,重匹配中")
+        self.assertEqual(c.mode, "sf")
+        self.assertFalse([a for a in adb.calls if "gfxinfo" in " ".join(a)])
+
+        adb.layer = self.L1                       # 层找回：正常出数
+        r4 = c.sample(4.0)
+        self.assertEqual(r4["layer"], self.L1)
+        self.assertEqual(r4["frame_p50_ms"], 16.67)
+
+
+class TestExportFpsSource(unittest.TestCase):
+    """导出扁平化透出 FPS 通道标记（2026-08-25，二次评估 kimi）。"""
+
+    def test_columns_and_headers_aligned(self):
+        keys = [k for k, _ in COLUMNS]
+        self.assertIn("fps_source", keys)
+        self.assertEqual(len(keys), len(set(keys)))          # 无重复列 key
+        self.assertTrue(all(label for _, label in COLUMNS))  # 每列都有表头
+
+    def test_sf_row_marked_sf(self):
+        row = {"t_ms": 500, "fps": {"layer": "SurfaceView[x]#1", "total_frames": 120,
+                                    "fps": 59.9, "jank_rate": 0.0, "refresh_hz": 60.0}}
+        self.assertEqual(flatten(row)["fps_source"], "sf")
+
+    def test_gfx_row_marked_gfxinfo(self):
+        row = {"t_ms": 500, "fps": {"layer": "com.x/Act#1", "total_frames": 100, "fps": 60.0,
+                                    "jank_rate": 0.01, "refresh_hz": None, "source": "gfxinfo"}}
+        self.assertEqual(flatten(row)["fps_source"], "gfxinfo")
+
+    def test_error_and_missing_rows_blank(self):
+        err = {"t_ms": 500, "fps": {"layer": None, "total_frames": None, "fps": None,
+                                    "jank_rate": None, "error": "no_layer"}}
+        self.assertEqual(flatten(err)["fps_source"], "")
+        self.assertEqual(flatten({"t_ms": 0})["fps_source"], "")
+
+
+class TestReportCacheLru(unittest.TestCase):
+    """/api/report 解析缓存改 LRU（2026-08-25，二次评估 #2）。
+
+    旧实现超上限整体 clear()：报告数 >50 时，常看的几份会被"连坐"清掉，
+    每次点开都要重新全文解析（1MB jsonl ~50ms）。
+    直接调真实的 Handler._load_report（该方法只用闭包里的 server，不碰 self/socket）。
+    """
+
+    def _server_with_reports(self, count, cache_max):
+        import json as _json
+        import shutil
+        import tempfile
+        from web import WebServer
+
+        tmp = tempfile.mkdtemp(prefix="perfdog_test_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        names = []
+        for i in range(count):
+            name = f"r{i}.jsonl"
+            with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+                f.write(_json.dumps({"t_ms": i * 500, "fps": {"fps": 60.0}}) + "\n")
+            names.append(name)
+        server = WebServer(port=0, output_dir=tmp)
+        server._report_cache_max = cache_max
+        handler_cls = server._make_handler()
+        dummy = handler_cls.__new__(handler_cls)          # 不走 socket 初始化
+
+        def load(name):
+            return handler_cls._load_report(dummy, name)
+
+        return server, names, load
+
+    def test_lru_evicts_least_recently_used_only(self):
+        server, names, load = self._server_with_reports(4, cache_max=3)
+        rows = load(names[0])
+        self.assertEqual(rows[0]["t_ms"], 0)
+        load(names[1])
+        load(names[2])
+        self.assertEqual(list(server._report_cache), names[:3])
+
+        load(names[0])                                     # 命中 → 提升为最近使用
+        self.assertEqual(list(server._report_cache)[-1], names[0])
+
+        load(names[3])                                     # 超上限 → 只淘汰最久未使用的
+        self.assertEqual(len(server._report_cache), 3)
+        self.assertNotIn(names[1], server._report_cache)   # r1 最久未用，被淘汰
+        self.assertIn(names[0], server._report_cache)      # 热点保留（旧实现此处已被清空）
+        self.assertIn(names[2], server._report_cache)
+        self.assertIn(names[3], server._report_cache)
+
+    def test_cache_hit_returns_same_object_and_invalidates_on_change(self):
+        server, names, load = self._server_with_reports(1, cache_max=3)
+        first = load(names[0])
+        self.assertIs(load(names[0]), first)               # 命中缓存，不重复解析
+
+        path = os.path.join(server.output_dir, names[0])   # 文件变化（size/mtime）→ 失效重读
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"t_ms": 0}\n{"t_ms": 500}\n')
+        again = load(names[0])
+        self.assertEqual(len(again), 2)
+        self.assertEqual(len(server._report_cache), 1)     # 同名只占一条
+
+    def test_bad_name_and_traversal_rejected(self):
+        server, names, load = self._server_with_reports(1, cache_max=3)
+        self.assertEqual(load("")["error"], "bad name")
+        self.assertEqual(load("x.txt")["error"], "bad name")
+        self.assertEqual(load("../x.jsonl")["error"], "bad path")
+        self.assertEqual(load("nope.jsonl")["error"], "no such file")
+        self.assertEqual(len(server._report_cache), 0)     # 非法/失败请求不污染缓存
 
 
 class TestMemParsers(unittest.TestCase):

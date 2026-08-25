@@ -25,6 +25,7 @@ import random
 import re
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -77,9 +78,11 @@ class WebServer:
         # _runs_lines 的读改写若交叉可能触发 "dictionary changed size during iteration"，
         # 该异常若不兜底会让 handler 线程崩溃 → 连接被重置 → 前端 Failed to fetch
         self._runs_lock = threading.Lock()
-        # /api/report 解析缓存：{name: (mtime_ns, size, rows)}，历史 jsonl 不可变
-        self._report_cache = {}
-        # report 缓存上限：超过则整体清空重建（简单防膨胀）
+        # /api/report 解析缓存：OrderedDict{name: (mtime_ns, size, rows)}，历史 jsonl 不可变。
+        # 用 LRU 淘汰（2026-08-25）：旧实现超上限整体 clear()，报告数 >50 时命中率断崖式
+        # 归零（每次清空后所有报告都要重新全文解析）；改为只淘汰最久未使用的那条
+        self._report_cache = OrderedDict()
+        # report 缓存条数上限：超过则按 LRU 逐条淘汰最久未使用项（语义不变，仍是防膨胀）
         self._report_cache_max = 50
         # report 缓存互斥锁（2026-08-24）：ThreadingHTTPServer 下 /api/report 并发
         # 时缓存的 get/set/clear 可能交叉——GIL 只保证单条字节码原子，读改写序列
@@ -722,9 +725,13 @@ class WebServer:
                 # 反复点开同一报告不再全文读 + JSON 解析（1MB jsonl ~50ms → 0）。
                 # 缓存读写在 _report_lock 内（2026-08-24）：ThreadingHTTPServer 并发时
                 # 避免 get/set/clear 交叉；同一报告的并发请求串行命中缓存不重复解析。
+                # 淘汰策略为 LRU（2026-08-25）：命中 move_to_end 提升为最近使用，超限
+                # 只 popitem(last=False) 淘汰最久未使用项——旧的整体 clear() 在报告数
+                # 超过上限时会让命中率断崖归零（常看的几份报告每次都被连坐清掉）。
                 with server._report_lock:
                     entry = server._report_cache.get(name)
                     if entry and entry[0] == st.st_mtime_ns and entry[1] == st.st_size:
+                        server._report_cache.move_to_end(name)
                         return entry[2]
                     try:
                         rows = []
@@ -736,8 +743,9 @@ class WebServer:
                     except Exception as e:
                         return {"error": str(e)}
                     server._report_cache[name] = (st.st_mtime_ns, st.st_size, rows)
-                    if len(server._report_cache) > server._report_cache_max:
-                        server._report_cache.clear()
+                    server._report_cache.move_to_end(name)   # 覆盖旧条目时也要提到队尾
+                    while len(server._report_cache) > server._report_cache_max:
+                        server._report_cache.popitem(last=False)
                     return rows
 
         return Handler

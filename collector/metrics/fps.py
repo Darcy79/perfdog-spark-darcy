@@ -57,7 +57,8 @@ class FpsCollector:
         self._next_resolve = 0.0
         self._last_max_ts = None   # 上次缓冲最新帧时间戳（用于静止判断）
         self._last_seen_ts = None  # 上次缓冲最大有效帧时间戳（用于"只算新帧"）
-        self._last_frame_stats = None  # 最近一次由新帧算出的帧时间分布（无新帧时沿用）
+        # 最近一次由新帧算出的帧时间分布（无新帧时沿用；层切换时随基准一并重置）
+        self._last_frame_stats = None
         # FPS 双通道（2026-08-13 扩展支持任意 App）：
         #   sf  = SurfaceFlinger --latency（微信小游戏 SurfaceView 层）
         #   gfx = dumpsys gfxinfo 增量（普通 View 应用——SF 窗口层无帧统计）
@@ -115,8 +116,29 @@ class FpsCollector:
         # 优先 BLAST，其次普通 SurfaceView，最后窗口层（普通 View 应用）
         return (blast or normal or window or [None])[0]
 
+    def _reset_frame_baseline(self):
+        """清空与"当前层缓冲"绑定的帧统计基准（层重建后旧基准全部失效）。
+
+        只动帧统计三件套，不碰 mode / _ever_surfaceview / _gfx_* ——
+        "SF 层短暂丢失时保留 sf 通道重匹配"的记忆逻辑依赖后者。
+        """
+        self._last_max_ts = None
+        self._last_seen_ts = None
+        self._last_frame_stats = None
+
     def _set_layer(self, layer):
-        """记录当前层及其类型（SurfaceView 层才有 SF 帧统计）。"""
+        """记录当前层及其类型（SurfaceView 层才有 SF 帧统计）。
+
+        层名变化（切场景/游戏重启导致渲染层重建，#id 随之改变；或读取失败置空）
+        时重置帧统计基准（2026-08-25 修复跨层残留）：
+          - _last_frame_stats：新层前两个采样点若新帧不足 2 个，会沿用**旧层**的
+            P50/P95/Max 读数，曲线上表现为切场景后仍显示上一场景的帧时间
+          - _last_seen_ts / _last_max_ts：新层时间戳与旧层不连续，续用旧基准会把
+            新层的帧误判为"非新增帧"（漏算 Jank）或"未推进"（FPS 误判为 0/stale）
+        重置后首个采样点按"首轮"处理：整个缓冲都算新帧，直接出该层自己的统计。
+        """
+        if layer != self.layer:
+            self._reset_frame_baseline()
         self.layer = layer
         self.layer_is_surfaceview = bool(layer and layer.startswith("SurfaceView["))
         if self.layer_is_surfaceview:

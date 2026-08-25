@@ -772,32 +772,36 @@
   // ---------------- 事件标注层（2026-08-14 模式1：logcat console.log 叠加） ----------------
   // 把事件按 t_ms 映射到 x 轴类目值，在每张图画竖线标注；
   // 第一张图（FPS）附带文字标签，其余图只画线（避免标签 6 次重复）。
+  // v36 修复：类目轴值是采样点时间（rows 的 t_ms 递增，多为整数秒），事件时刻
+  // （如 10.4s）未必命中类目 → 此前 Math.round(ev.t_ms/100)/10 映射的类目在
+  // ECharts 类目轴中找不到对应值会静默不渲染（大部分事件线丢失）。
+  // 改为二分找最近采样点，保证标注线一定落在曲线窗口内。
+  // v40：抽成纯函数并导出（window.PerfCharts.nearestCat），便于脱离浏览器做边界断言
+  // （见 tests/test_nearest_cat.js）。times 必须是递增的 t_ms 数组。
+  // 返回类目轴取值（秒，1 位小数）；times 为空或 ms 无效返回 null。
+  function nearestCat(times, ms) {
+    if (ms == null || !times || !times.length) return null;
+    var cat = function (v) { return Math.round(v / 100) / 10; };
+    if (ms <= times[0]) return cat(times[0]);
+    if (ms >= times[times.length - 1]) return cat(times[times.length - 1]);
+    var lo = 0, hi = times.length - 1;
+    while (lo < hi - 1) {
+      var mid = (lo + hi) >> 1;
+      if (times[mid] <= ms) lo = mid; else hi = mid;
+    }
+    // 等距时取左侧采样点（与统计栏"落在哪个采样点"口径一致）
+    return (ms - times[lo] <= times[hi] - ms) ? cat(times[lo]) : cat(times[hi]);
+  }
+
   function renderEvents(charts, rows, events) {
     if (!events || !events.length || !rows || !rows.length) return;
     var MAX_EV = 200;
-    // v36 修复：类目轴值是采样点时间（rows 的 t_ms 递增，多为整数秒），事件时刻
-    // （如 10.4s）未必命中类目 → 此前 Math.round(ev.t_ms/100)/10 映射的类目在
-    // ECharts 类目轴中找不到对应值会静默不渲染（大部分事件线丢失）。
-    // 改为二分找最近采样点，保证标注线一定落在曲线窗口内。
     var times = rows.map(function (r) { return r.t_ms; });
-    function nearestCat(ms) {
-      if (ms == null || !times.length) return null;
-      if (ms <= times[0]) return Math.round(times[0] / 100) / 10;
-      if (ms >= times[times.length - 1]) return Math.round(times[times.length - 1] / 100) / 10;
-      var lo = 0, hi = times.length - 1;
-      while (lo < hi - 1) {
-        var mid = (lo + hi) >> 1;
-        if (times[mid] <= ms) lo = mid; else hi = mid;
-      }
-      return (ms - times[lo] <= times[hi] - ms)
-        ? Math.round(times[lo] / 100) / 10
-        : Math.round(times[hi] / 100) / 10;
-    }
     var markers = [];
     events.forEach(function (ev) {
       if (markers.length >= MAX_EV) return;
       if (!ev || ev.t_ms == null) return;
-      var cat = nearestCat(ev.t_ms);
+      var cat = nearestCat(times, ev.t_ms);
       if (cat === null) return;
       var isErr = ev.level === 'E' || ev.level === 'F';
       markers.push({
@@ -840,6 +844,7 @@
     createTimeSliders: createTimeSliders,
     clearTimeSliders: clearTimeSliders,
     renderEvents: renderEvents,
+    nearestCat: nearestCat,   // 纯函数，导出供 tests/test_nearest_cat.js 断言
     setPinData: setPinData,
     renderAll: renderAll,
     updateStats: updateStats,
