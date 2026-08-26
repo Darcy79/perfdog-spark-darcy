@@ -76,9 +76,37 @@ eq(nearestCat(LONG, 250 * 500 + 10), 125, '长序列：偏左取左邻');
 eq(nearestCat(LONG, 250 * 500 - 10), 125, '长序列：偏右取右邻');
 eq(nearestCat(LONG, 999 * 500), 499.5, '长序列：命中末点');
 
+// ---------------- prepareRows：event 行过滤 + 核数抽取（v41 任务 3） ----------------
+const prepareRows = window.PerfCharts && window.PerfCharts.prepareRows;
+const setCores = window.PerfCharts && window.PerfCharts.setCores;
+if (typeof prepareRows !== 'function' || typeof setCores !== 'function') {
+  console.error('[x] app.js 未导出 window.PerfCharts.prepareRows/setCores');
+  process.exit(1);
+}
+{
+  const pr = prepareRows([
+    { ts: 1.0, event: 'meta', cores: 8 },
+    { t_ms: 500, cpu: { cpu_proc_pct: 50 } },
+    { ts: 2.0, event: 'target_switch', to: 'com.x' },
+  ]);
+  eq(pr.rows.length, 1, 'prepareRows：event 行被过滤');
+  eq(pr.rows[0].t_ms, 500, 'prepareRows：保留真实采样点');
+  eq(pr.cores, 8, 'prepareRows：抽出核数 8');
+}
+{
+  const pr2 = prepareRows([{ t_ms: 0, cpu: { cpu_proc_pct: 10 } }]);
+  eq(pr2.rows.length, 1, 'prepareRows：无 meta 时保留采样点');
+  eq(pr2.cores, null, 'prepareRows：无 meta 时核数为 null');
+}
+{
+  setCores(12);
+  const pr3 = prepareRows([{ t_ms: 0, cpu: {} }]);   // 无 meta → 重置为 null，不沿用上次 12
+  eq(pr3.cores, null, 'prepareRows：无 meta 时重置核数（不沿用旧报告）');
+}
+
 if (failures.length) {
-  console.error(`[x] nearestCat 断言失败 ${failures.length} 条（通过 ${passed}）：`);
+  console.error(`[x] 断言失败 ${failures.length} 条（通过 ${passed}）：`);
   failures.forEach((f) => console.error('    - ' + f));
   process.exit(1);
 }
-console.log(`[+] nearestCat 全部断言通过（${passed} 条）`);
+console.log(`[+] 全部断言通过（${passed} 条）`);

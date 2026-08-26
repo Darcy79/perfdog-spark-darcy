@@ -49,6 +49,28 @@ def load_rows(path):
     return rows
 
 
+def extract_cores(rows, default=None):
+    """从 meta 行（{"event":"meta","cores":N}）读核数；无则返回 default。"""
+    for r in rows or []:
+        if isinstance(r, dict) and r.get("event") == "meta" and r.get("cores"):
+            try:
+                v = int(r["cores"])
+                if 1 <= v <= 256:
+                    return v
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
+def data_rows(rows):
+    """过滤 event 行（meta / target_switch），只保留真正的采样点。
+
+    event 行没有 t_ms / 指标字段，若当采样点导出会产生空行，且 x 轴类目被塞进 NaN。
+    核数单独经 extract_cores 读取，不在此处丢失。
+    """
+    return [r for r in (rows or []) if isinstance(r, dict) and not r.get("event")]
+
+
 def fps_source(f):
     """判定该采样点的 FPS 采集通道："sf" / "gfxinfo" / ""（无数据或错误）。
 
@@ -86,6 +108,7 @@ def flatten(row):
 
 
 def export_csv(rows, out_path):
+    rows = data_rows(rows)   # 过滤 meta/target_switch 事件行，避免空行
     flat = [flatten(r) for r in rows]
     with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
@@ -102,6 +125,7 @@ def export_xlsx(rows, out_path):
         print("[!] 需要 openpyxl。请用以下命令运行（uv 零安装）：")
         print('    uv run --with openpyxl python export_report.py --input ... --format xlsx')
         sys.exit(1)
+    rows = data_rows(rows)
     flat = [flatten(r) for r in rows]
     wb = Workbook()
     ws = wb.active
@@ -119,6 +143,8 @@ def export_html(rows, out_path, events=None):
         with open(p, encoding="utf-8") as f:
             return f.read()
 
+    cores = extract_cores(rows)      # 从 meta 行读核数（供 CPU 图"进程占整机%"）
+    rows = data_rows(rows)           # 过滤 meta/target_switch 事件行
     echarts = read(os.path.join(ASSETS_DIR, "echarts.min.js"))
     appjs = read(os.path.join(ASSETS_DIR, "app.js"))
     style = read(os.path.join(ASSETS_DIR, "style.css"))
@@ -142,6 +168,7 @@ def export_html(rows, out_path, events=None):
         except Exception:
             pass
     events_json = json.dumps(events, ensure_ascii=False)
+    cores_json = json.dumps(cores)   # None → "null"，JS 侧 falsy
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -178,6 +205,8 @@ def export_html(rows, out_path, events=None):
   charts.net = window.PerfCharts.makeChart('chart-net');
   charts.temp = window.PerfCharts.makeChart('chart-temp');
   var ROWS = {data};
+  var CORES = {cores_json};
+  if (CORES) window.PerfCharts.setCores(CORES);
   window.PerfCharts.renderAll(charts, ROWS, {{ zoom: true }});
   window.PerfCharts.updateStats(charts, ROWS);
   window.PerfCharts.renderSummary('report-summary', window.PerfCharts.computeStats(ROWS));

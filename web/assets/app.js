@@ -98,6 +98,37 @@
   var _pinCharts = [];
   var _pinIdx = null;
 
+  // v41：判断点击是否落在 legend 区域（右上角"自选数据"）。legend 也在 canvas 内，
+  // 点击选中/取消系列会触发 DOM click → 若不拦截，_pinIndexAtPx 会把贯穿线锁到
+  // legend 所在像素（右上角）。返回 true 表示命中了 legend，应跳过锁定/解锁。
+  function _hitLegend(chart, clientX, clientY) {
+    try {
+      var dom = chart.getDom();
+      var r = dom.getBoundingClientRect();
+      var x = clientX - r.left;
+      var y = clientY - r.top;
+      var model = chart.getModel();
+      // getComponent('legend', true) 返回所有 legend 模型（多图时 legend 通常一个，防御性处理）
+      var legends = model.getComponent ? model.getComponent('legend', true) : null;
+      var list = (Array.isArray(legends) ? legends : (legends ? [legends] : []));
+      for (var i = 0; i < list.length; i++) {
+        var lm = list[i];
+        var rect = lm && lm.coordinateSystem && lm.coordinateSystem.getBoundingRect
+          ? lm.coordinateSystem.getBoundingRect() : null;
+        if (!rect) continue;
+        // rect 是 ZRender 内部像素（可能受 devicePixelRatio 缩放）→ 换算成容器内 CSS 像素
+        var pr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0)
+          ? window.devicePixelRatio : 1;
+        // 保守加 4px 容差：legend 换行/贴边时点击紧邻空白也算命中
+        var pad = 4;
+        var L = rect.x / pr - pad, T = rect.y / pr - pad,
+            R = (rect.x + rect.width) / pr + pad, B = (rect.y + rect.height) / pr + pad;
+        if (x >= L && x <= R && y >= T && y <= B) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
   function enableClickPin(groupSel) {
     _pinCharts = [];
     try {
@@ -121,6 +152,8 @@
 
       dom.addEventListener('click', function (e) {
         var x = e.clientX, y = e.clientY;
+        // v41：点击 legend（右上角自选数据）时不锁定/解锁贯穿线，避免把蓝线锁到 legend 位置
+        if (_hitLegend(chart, x, y)) { console.log('[PerfDog] 点击 legend → 跳过贯穿线锁定'); return; }
         var r = dom.getBoundingClientRect();
         var localX = x - r.left;      // 容器内像素 x（所见即所点的位置）
         var idx = _pinIndexAtPx(chart, dom, x, y);
@@ -184,7 +217,7 @@
   var _PIN_FIELDS = {
     'chart-fps':       function (r) { var f = r.fps || {}; var s = []; if (f.fps != null) s.push('FPS ' + f.fps); if (f.jank_rate != null) s.push('Jank ' + (f.jank_rate * 100).toFixed(1) + '%'); return s.join(' · '); },
     'chart-frametime': function (r) { var f = r.fps || {}; var s = []; if (f.frame_p50_ms != null) s.push('P50 ' + f.frame_p50_ms + 'ms'); if (f.frame_max_ms != null) s.push('Max ' + f.frame_max_ms + 'ms'); return s.join(' · '); },
-    'chart-cpu':       function (r) { var c = r.cpu || {}; var s = []; if (c.cpu_total_pct != null) s.push('总 ' + c.cpu_total_pct + '%'); if (c.cpu_proc_pct != null) s.push('进程 ' + c.cpu_proc_pct + '%'); return s.join(' · '); },
+    'chart-cpu':       function (r) { var c = r.cpu || {}; var s = []; if (c.cpu_total_pct != null) s.push('总 ' + c.cpu_total_pct + '%'); if (c.cpu_proc_pct != null) s.push('进程 ' + c.cpu_proc_pct + '%'); if (_cores && c.cpu_proc_pct != null) s.push('占整机 ' + (c.cpu_proc_pct / _cores).toFixed(1) + '%'); return s.join(' · '); },
     'chart-mem':       function (r) { var m = r.mem || {}; var s = []; if (m.pss_kb != null) s.push('PSS ' + (m.pss_kb / 1024).toFixed(1) + 'MB'); if (m.vmrss_kb != null) s.push('RSS ' + (m.vmrss_kb / 1024).toFixed(1) + 'MB'); return s.join(' · '); },
     'chart-net':       function (r) { var n = r.net || {}; var s = []; if (n.rx_kbps != null) s.push('↓' + n.rx_kbps); if (n.tx_kbps != null) s.push('↑' + n.tx_kbps); return s.join(' · ') + ' KB/s'; },
     'chart-temp':      function (r) { var t = r.therm || {}; var s = []; if (t.temp_c != null) s.push(t.temp_c + '°C'); if (t.voltage_v != null) s.push(t.voltage_v + 'V'); return s.join(' · '); },
@@ -472,6 +505,27 @@
     return a[Math.max(0, Math.min(idx, a.length - 1))];
   }
 
+  // v41：把 jsonl 原始行清洗为"纯采样点"并抽出 meta 行的核数。
+  // meta / target_switch 等 event 行（无 t_ms、无 fps/cpu 字段）不参与绘图与统计，
+  // 否则会在 x 轴塞进 NaN 类目、污染帧/CPU 等系列；核数从 {"event":"meta","cores":N} 提取。
+  // 返回 { rows: [...], cores: <number|null> }；cores 已同步 setCores。
+  function prepareRows(raw) {
+    var rows = [], cores = null;
+    (raw || []).forEach(function (r) {
+      if (!r || typeof r !== 'object') return;
+      if (r.event) {
+        if (r.event === 'meta' && r.cores) {
+          var c = parseInt(r.cores, 10);
+          if (isFinite(c) && c > 0) cores = c;
+        }
+        return;   // event 行（meta / target_switch）不当作采样点
+      }
+      rows.push(r);
+    });
+    setCores(cores);   // 无论是否读到都重置：避免切到无 meta 行的报告时沿用上一份的核数
+    return { rows: rows, cores: cores };
+  }
+
   function statText(arr, unit, digits) {
     var d = digits || 1;
     var a = clean(arr);
@@ -491,6 +545,28 @@
 
   var baseLine = { type: 'line', showSymbol: false, connectNulls: true,
                    lineStyle: { width: 1.6 }, sampling: 'lttb' };
+
+  // v41：集中颜色映射——series 顶层 color（决定 legend 图标色 + tooltip marker 色）
+  // 与 lineStyle.color（决定曲线色）必须取同一值，否则会出现"legend 图标一个色、
+  // 曲线另一个色、白线 tooltip marker 又一个色"的错位。取值以既有 lineStyle.color 为准，
+  // 不改变曲线本身颜色。
+  var COLORS = {
+    fps: '#4fc3f7', jank: '#ff8a65',
+    p50: '#80deea', p95: '#ffab40', max: '#ef5350',
+    cpu_total: '#81c784', cpu_proc: '#ffd54f', cpu_proc_of_total: '#b39ddb',
+    pss: '#ba68c8', rss: '#90a4ae',
+    rx: '#4dd0e1', tx: '#f06292',
+    temp: '#ff7043', power: '#aed581',
+  };
+
+  // 核数（cpu_proc_pct ÷ 核数 = 进程占整机%）。实时看板从 /api/status 注入；
+  // 历史报告从 jsonl 的 meta 行（{"event":"meta","cores":N}）读出；未知时 null，
+  // 此时"进程占整机%"曲线不渲染（renderCpu 内判断）。
+  var _cores = null;
+  function setCores(n) {
+    var v = parseInt(n, 10);
+    _cores = (typeof v === 'number' && isFinite(v) && v > 0) ? v : null;
+  }
 
   function baseOption(zoom) {
     var opt = {
@@ -574,8 +650,8 @@
     chart.setOption({
       ...baseOption(zoom),
       series: [
-        Object.assign({}, baseLine, { name: 'FPS', data: fps, yAxisIndex: 0, lineStyle: { width: 1.6, color: '#4fc3f7' } }),
-        Object.assign({}, baseLine, { name: 'Jank%', data: jank, yAxisIndex: 1, lineStyle: { width: 1.2, color: '#ff8a65' } }),
+        Object.assign({}, baseLine, { name: 'FPS', data: fps, yAxisIndex: 0, color: COLORS.fps, lineStyle: { width: 1.6, color: COLORS.fps } }),
+        Object.assign({}, baseLine, { name: 'Jank%', data: jank, yAxisIndex: 1, color: COLORS.jank, lineStyle: { width: 1.2, color: COLORS.jank } }),
       ],
       yAxis: [
         { type: 'value', min: 0, max: maxFps, interval: step, axisLabel: { fontSize: 10 } },
@@ -594,9 +670,9 @@
       yAxis: { type: 'value', name: 'ms', nameLocation: 'middle', nameGap: 36,
                min: 0, axisLabel: { fontSize: 10 } },
       series: [
-        Object.assign({}, baseLine, { name: 'P50', data: p50, lineStyle: { width: 1.4, color: '#80deea' } }),
-        Object.assign({}, baseLine, { name: 'P95', data: p95, lineStyle: { width: 1.6, color: '#ffab40' } }),
-        Object.assign({}, baseLine, { name: 'Max', data: mx, lineStyle: { width: 1.2, color: '#ef5350' } }),
+        Object.assign({}, baseLine, { name: 'P50', data: p50, color: COLORS.p50, lineStyle: { width: 1.4, color: COLORS.p50 } }),
+        Object.assign({}, baseLine, { name: 'P95', data: p95, color: COLORS.p95, lineStyle: { width: 1.6, color: COLORS.p95 } }),
+        Object.assign({}, baseLine, { name: 'Max', data: mx, color: COLORS.max, lineStyle: { width: 1.2, color: COLORS.max } }),
       ],
     });
   }
@@ -604,14 +680,29 @@
   function renderCpu(chart, rows, zoom) {
     var total = series(rows, function (r) { return r.cpu ? r.cpu.cpu_total_pct : null; });
     var proc = series(rows, function (r) { return r.cpu ? r.cpu.cpu_proc_pct : null; });
+    // v41：进程占整机% = cpu_proc_pct ÷ 核数。核数从 /api/status（实时）或 jsonl
+    // meta 行（历史）取得；未知时不渲染该曲线（setCores 未注入 / meta 缺失）。
+    var procOfTotal = _cores
+      ? series(rows, function (r) {
+          var p = r.cpu ? r.cpu.cpu_proc_pct : null;
+          return (typeof p === 'number' && isFinite(p)) ? Math.round(p / _cores * 100) / 100 : null;
+        })
+      : null;
+    var seriesList = [
+      Object.assign({}, baseLine, { name: '整机%', data: total, color: COLORS.cpu_total, lineStyle: { width: 1.6, color: COLORS.cpu_total } }),
+      Object.assign({}, baseLine, { name: '进程%', data: proc, color: COLORS.cpu_proc, lineStyle: { width: 1.6, color: COLORS.cpu_proc } }),
+    ];
+    if (procOfTotal) {
+      seriesList.push(Object.assign({}, baseLine, {
+        name: '进程占整机%', data: procOfTotal, color: COLORS.cpu_proc_of_total,
+        lineStyle: { width: 1.4, color: COLORS.cpu_proc_of_total },
+      }));
+    }
     chart.setOption({
       ...baseOption(zoom),
       yAxis: { type: 'value', name: '%', nameLocation: 'middle', nameGap: 36,
                min: 0, axisLabel: { fontSize: 10 } },
-      series: [
-        Object.assign({}, baseLine, { name: '整机%', data: total, lineStyle: { width: 1.6, color: '#81c784' } }),
-        Object.assign({}, baseLine, { name: '进程%', data: proc, lineStyle: { width: 1.6, color: '#ffd54f' } }),
-      ],
+      series: seriesList,
     });
   }
 
@@ -627,8 +718,8 @@
       yAxis: { type: 'value', name: 'MB', nameLocation: 'middle', nameGap: 36,
                min: 0, axisLabel: { fontSize: 10 } },
       series: [
-        Object.assign({}, baseLine, { name: 'PSS MB', data: pss, lineStyle: { width: 1.6, color: '#ba68c8' } }),
-        Object.assign({}, baseLine, { name: 'RSS MB', data: rss, lineStyle: { width: 1.2, color: '#90a4ae' } }),
+        Object.assign({}, baseLine, { name: 'PSS MB', data: pss, color: COLORS.pss, lineStyle: { width: 1.6, color: COLORS.pss } }),
+        Object.assign({}, baseLine, { name: 'RSS MB', data: rss, color: COLORS.rss, lineStyle: { width: 1.2, color: COLORS.rss } }),
       ],
     });
   }
@@ -641,8 +732,8 @@
       yAxis: { type: 'value', name: 'KB/s', nameLocation: 'middle', nameGap: 36,
                min: 0, axisLabel: { fontSize: 10 } },
       series: [
-        Object.assign({}, baseLine, { name: '下行↓', data: rx, lineStyle: { width: 1.6, color: '#4dd0e1' } }),
-        Object.assign({}, baseLine, { name: '上行↑', data: tx, lineStyle: { width: 1.6, color: '#f06292' } }),
+        Object.assign({}, baseLine, { name: '下行↓', data: rx, color: COLORS.rx, lineStyle: { width: 1.6, color: COLORS.rx } }),
+        Object.assign({}, baseLine, { name: '上行↑', data: tx, color: COLORS.tx, lineStyle: { width: 1.6, color: COLORS.tx } }),
       ],
     });
   }
@@ -659,8 +750,8 @@
           min: 0, axisLabel: { fontSize: 10 }, splitLine: { show: false } },
       ],
       series: [
-        Object.assign({}, baseLine, { name: '温度°C', data: temp, yAxisIndex: 0, lineStyle: { width: 1.6, color: '#ff7043' } }),
-        Object.assign({}, baseLine, { name: '功率W', data: power, yAxisIndex: 1, lineStyle: { width: 1.2, color: '#aed581' } }),
+        Object.assign({}, baseLine, { name: '温度°C', data: temp, yAxisIndex: 0, color: COLORS.temp, lineStyle: { width: 1.6, color: COLORS.temp } }),
+        Object.assign({}, baseLine, { name: '功率W', data: power, yAxisIndex: 1, color: COLORS.power, lineStyle: { width: 1.2, color: COLORS.power } }),
       ],
     });
   }
@@ -845,6 +936,8 @@
     clearTimeSliders: clearTimeSliders,
     renderEvents: renderEvents,
     nearestCat: nearestCat,   // 纯函数，导出供 tests/test_nearest_cat.js 断言
+    setCores: setCores,       // 注入核数（实时看板 /api/status；历史报告 meta 行）
+    prepareRows: prepareRows, // 清洗 event 行 + 抽取核数（历史报告/导出 HTML 用）
     setPinData: setPinData,
     renderAll: renderAll,
     updateStats: updateStats,

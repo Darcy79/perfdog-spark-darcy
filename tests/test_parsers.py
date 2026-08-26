@@ -24,7 +24,7 @@ from metrics.mem import parse_smaps_rollup, parse_meminfo
 from metrics.cpu import CpuCollector
 from metrics.thermal import ThermalCollector
 from pidresolver import PidResolver
-from export_report import COLUMNS, flatten
+from export_report import COLUMNS, flatten, extract_cores, data_rows
 
 
 class MockAdb:
@@ -210,6 +210,41 @@ class TestExportFpsSource(unittest.TestCase):
                                     "jank_rate": None, "error": "no_layer"}}
         self.assertEqual(flatten(err)["fps_source"], "")
         self.assertEqual(flatten({"t_ms": 0})["fps_source"], "")
+
+
+class TestCoresProbeAndMeta(unittest.TestCase):
+    """核数探测（nproc）与 jsonl meta 行兼容（2026-08-26，任务 3）。"""
+
+    def test_probe_cores_parses_nproc(self):
+        adb = MockAdb({"nproc": "8\n"})
+        self.assertEqual(CpuCollector.probe_cores(adb), 8)
+
+    def test_probe_cores_falls_back_on_bad_output(self):
+        adb = MockAdb({"nproc": "not-a-number\n"})
+        self.assertEqual(CpuCollector.probe_cores(adb), 8)   # 解析失败 → 兜底 8
+        adb2 = MockAdb({"nproc": "0\n"})
+        self.assertEqual(CpuCollector.probe_cores(adb2), 8)  # 非法核数 → 兜底 8
+
+    def test_probe_cores_default_override(self):
+        adb = MockAdb({"nproc": "not-a-number\n"})
+        self.assertEqual(CpuCollector.probe_cores(adb, default=12), 12)
+
+    def test_extract_cores_and_data_rows_filter_meta(self):
+        rows = [
+            {"ts": 1.0, "event": "meta", "cores": 8},
+            {"ts": 1.0, "t_ms": 0, "cpu": {"cpu_proc_pct": 50.0}},
+            {"ts": 2.0, "t_ms": 1000, "cpu": {"cpu_proc_pct": 60.0}},
+            {"ts": 2.0, "event": "target_switch", "to": "com.x"},
+        ]
+        self.assertEqual(extract_cores(rows), 8)
+        d = data_rows(rows)
+        self.assertEqual(len(d), 2)                     # meta / target_switch 被过滤
+        self.assertTrue(all("event" not in r for r in d))
+        self.assertEqual([r["t_ms"] for r in d], [0, 1000])
+
+    def test_extract_cores_absent_returns_none(self):
+        self.assertIsNone(extract_cores([{"t_ms": 0, "cpu": {}}]))
+        self.assertIsNone(extract_cores([]))
 
 
 class TestReportCacheLru(unittest.TestCase):

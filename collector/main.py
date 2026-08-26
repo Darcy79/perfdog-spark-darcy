@@ -108,6 +108,11 @@ def main():
     therm = ThermalCollector(adb)
     collectors = {"fps": fps, "cpu": cpu, "mem": mem, "net": net, "therm": therm}
 
+    # 探测核数（2026-08-26）：供前端 CPU 图"进程占整机%"派生曲线（cpu_proc_pct ÷ 核数）。
+    # 写入 status（实时看板）+ jsonl meta 行（历史报告），让历史报告不依赖当前是否连设备。
+    cores = CpuCollector.probe_cores(adb)
+    print(f"[+] CPU 核数: {cores}")
+
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     # 每次采集新建一个按时间命名的文件夹，内含 jsonl 与 html 报告，避免历史数据混淆
     run_dir = os.path.join(outdir, run_id)
@@ -166,6 +171,7 @@ def main():
                              name="open-browser").start()
         web.set_status(running=True, device=adb.serial, pid=pid, run_id=run_id,
                        target=package, process_pattern=process_pattern,
+                       cores=cores,
                        started_at=datetime.now().strftime("%H:%M:%S"))
 
         # ---- 看板下拉"切换被测应用"回调（方案 A 2026-08-20） ----
@@ -280,6 +286,13 @@ def main():
     fail_streak = 0
     diag_shown = False
     with open(out_file, "w", encoding="utf-8") as f:
+        # meta 行（2026-08-26）：首行写入核数等采集元信息，供历史报告读取核数，
+        # 不依赖当前是否连接设备。event 行不参与采样点统计（前端 prepareRows 过滤）。
+        f.write(json.dumps({
+            "ts": round(time.time(), 3),
+            "event": "meta",
+            "cores": cores,
+        }, ensure_ascii=False) + "\n")
         while not stop["flag"]:
             ts = time.time()
             if args.duration and (ts - start) >= args.duration:

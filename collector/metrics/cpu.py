@@ -35,6 +35,22 @@ class CpuCollector:
         except Exception:
             return DEFAULT_CLK_TCK
 
+    @staticmethod
+    def probe_cores(adb, default=8):
+        """探测设备 CPU 核数（`adb shell nproc`，失败兜底 default）。
+
+        用于前端派生曲线"进程占整机% = cpu_proc_pct ÷ 核数"。nproc 是 Android
+        toybox 自带命令，绝大多数设备可用；个别精简系统缺失或返回异常时兜底。
+        """
+        try:
+            out = adb.shell(["nproc"])
+            v = int(out.strip())
+            if 1 <= v <= 256:
+                return v
+        except Exception:
+            pass
+        return default
+
     def sample(self, ts):
         pid = self.pid_resolver.current_pid(ts)
         if not pid:
