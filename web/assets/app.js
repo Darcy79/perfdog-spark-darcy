@@ -98,33 +98,50 @@
   var _pinCharts = [];
   var _pinIdx = null;
 
-  // v41：判断点击是否落在 legend 区域（右上角"自选数据"）。legend 也在 canvas 内，
+  // v42：判断点击是否落在 legend 区域（右上角"自选数据"）。legend 也在 canvas 内，
   // 点击选中/取消系列会触发 DOM click → 若不拦截，_pinIndexAtPx 会把贯穿线锁到
   // legend 所在像素（右上角）。返回 true 表示命中了 legend，应跳过锁定/解锁。
+  //
+  // v41 根因（已确认）：LegendModel 是 ComponentModel，不是坐标系统，没有
+  // `coordinateSystem` 属性 → `lm.coordinateSystem` 恒 undefined → rect 恒 null →
+  // 拦截完全失效。正确取法：`chart.getViewOfComponentModel(legendModel)` 拿 LegendView，
+  // 其 `group.getBoundingRect()` 返回 legend 内容包围盒（zrender 逻辑像素 = 容器 CSS 像素，
+  // ECharts 内部已处理 devicePixelRatio，无需再除）。
+  //
+  // v42 加固：getBoundingRect() 返回的是 group **局部坐标**包围盒；若 ECharts 把 legend
+  // 布局位移放在 group 自身的 x/y（transform）上，局部 rect 会偏向左上。用
+  // transformCoordToGlobal 把左上角转成 zrender 根坐标（= 容器 CSS 像素）再判定，
+  // 无该方法时回退原始坐标（zrender 4 兼容）。
   function _hitLegend(chart, clientX, clientY) {
     try {
       var dom = chart.getDom();
       var r = dom.getBoundingClientRect();
-      var x = clientX - r.left;
+      var x = clientX - r.left;   // 容器内 CSS 像素
       var y = clientY - r.top;
       var model = chart.getModel();
-      // getComponent('legend', true) 返回所有 legend 模型（多图时 legend 通常一个，防御性处理）
-      var legends = model.getComponent ? model.getComponent('legend', true) : null;
-      var list = (Array.isArray(legends) ? legends : (legends ? [legends] : []));
-      for (var i = 0; i < list.length; i++) {
-        var lm = list[i];
-        var rect = lm && lm.coordinateSystem && lm.coordinateSystem.getBoundingRect
-          ? lm.coordinateSystem.getBoundingRect() : null;
-        if (!rect) continue;
-        // rect 是 ZRender 内部像素（可能受 devicePixelRatio 缩放）→ 换算成容器内 CSS 像素
-        var pr = (typeof window.devicePixelRatio === 'number' && window.devicePixelRatio > 0)
-          ? window.devicePixelRatio : 1;
-        // 保守加 4px 容差：legend 换行/贴边时点击紧邻空白也算命中
-        var pad = 4;
-        var L = rect.x / pr - pad, T = rect.y / pr - pad,
-            R = (rect.x + rect.width) / pr + pad, B = (rect.y + rect.height) / pr + pad;
-        if (x >= L && x <= R && y >= T && y <= B) return true;
+      // getComponent('legend', true) 返回数组；getComponent('legend') 返回单个（本工具只有一个）
+      var lm = model.getComponent ? model.getComponent('legend') : null;
+      if (!lm) return false;
+      var view = chart.getViewOfComponentModel ? chart.getViewOfComponentModel(lm) : null;
+      var group = view && view.group;
+      var rect = group && group.getBoundingRect ? group.getBoundingRect() : null;
+      if (!rect) return false;
+      // 局部坐标 → zrender 全局坐标（含 group 位移/缩放）
+      var gx = rect.x, gy = rect.y;
+      if (group.transformCoordToGlobal) {
+        var pt = [];
+        try {
+          group.transformCoordToGlobal(rect.x, rect.y, pt);
+          if (pt && pt.length >= 2 && isFinite(pt[0]) && isFinite(pt[1])) {
+            gx = pt[0]; gy = pt[1];
+          }
+        } catch (e) {}
       }
+      // 保守加 4px 容差：legend 换行/贴边时点击紧邻空白也算命中
+      var pad = 4;
+      var L = gx - pad, T = gy - pad,
+          R = (gx + rect.width) + pad, B = (gy + rect.height) + pad;
+      return x >= L && x <= R && y >= T && y <= B;
     } catch (e) {}
     return false;
   }

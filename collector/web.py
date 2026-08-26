@@ -71,8 +71,9 @@ class WebServer:
         self._labels_file_lock = threading.Lock()
         # 失败缓存的随机抖动（0~1h）：防止大量包在同一时刻到期引发解析风暴
         self._label_retry_jitter = random.uniform(0, 3600)
-        # /api/runs 行数缓存：{rel: (mtime_ns, size, n)}，历史文件不可变，
-        # 只对 (mtime,size) 变化的文件重算行数（2026-08-21，output 27MB 不再每次全读）
+        # /api/runs 行数缓存：{rel: (mtime_ns, size, n, has_meta)}，历史文件不可变，
+        # 只对 (mtime,size) 变化的文件重算行数（2026-08-21，output 27MB 不再每次全读）；
+        # has_meta 记录首行是否 meta 行（v41 起），组响应时 points = n - has_meta
         self._runs_lines = {}
         # runs 行数缓存互斥锁（2026-08-24）：/api/runs 每 5s 轮询 + 并发打开报告时，
         # _runs_lines 的读改写若交叉可能触发 "dictionary changed size during iteration"，
@@ -640,21 +641,34 @@ class WebServer:
                     alive = {rel for rel, _, _ in files}
                     for rel in [r for r in server._runs_lines if r not in alive]:
                         server._runs_lines.pop(rel, None)
-                    # 只对 (mtime,size) 变化的文件重算行数
+                    # 只对 (mtime,size) 变化的文件重算行数；顺带读首行判断是否 meta 行
+                    # （v41 起 jsonl 首行是 {"event":"meta","cores":N}，不参与采样点计数）
                     for rel, mtime_ns, size in files:
                         entry = server._runs_lines.get(rel)
-                        if entry and entry[0] == mtime_ns and entry[1] == size:
+                        if entry and len(entry) >= 4 and entry[0] == mtime_ns and entry[1] == size:
                             continue
                         fp = os.path.join(base, rel.replace("/", os.sep))
                         try:
-                            n = sum(1 for _ in open(fp, encoding="utf-8"))
+                            n = 0
+                            has_meta = False
+                            with open(fp, encoding="utf-8") as f:
+                                first = f.readline()
+                                if first:
+                                    n = 1
+                                    # 解析首行 JSON 判 meta（比子串匹配稳，不受空格/字段序影响）
+                                    try:
+                                        head = json.loads(first)
+                                        has_meta = isinstance(head, dict) and head.get("event") == "meta"
+                                    except Exception:
+                                        has_meta = False
+                                n += sum(1 for _ in f)
                         except Exception:
                             continue
                         try:
                             st = os.stat(fp)
-                            server._runs_lines[rel] = (st.st_mtime_ns, st.st_size, n)
+                            server._runs_lines[rel] = (st.st_mtime_ns, st.st_size, n, has_meta)
                         except Exception:
-                            server._runs_lines[rel] = (mtime_ns, size, n)
+                            server._runs_lines[rel] = (mtime_ns, size, n, has_meta)
                     counts = {rel: server._runs_lines.get(rel) for rel, _, _ in files}
                 # 组响应（用锁外快照，remark 读取等文件 IO 不持锁）
                 out = []
@@ -662,7 +676,10 @@ class WebServer:
                     entry = counts.get(rel)
                     if not entry:
                         continue
-                    _, _, n = entry
+                    # 兼容旧缓存（3 元组）：无 meta 信息时按 0 处理
+                    _, _, n = entry[0], entry[1], entry[2]
+                    has_meta = entry[3] if len(entry) > 3 else False
+                    points = n - (1 if has_meta else 0)
                     fp = os.path.join(base, rel.replace("/", os.sep))
                     remark = ""
                     rp = fp + ".remark.txt"
@@ -674,7 +691,7 @@ class WebServer:
                     out.append({
                         "name": rel,
                         "size_kb": round(size / 1024, 1),
-                        "points": n,
+                        "points": points,
                         "mtime": datetime.fromtimestamp(mtime_ns / 1e9).strftime("%Y-%m-%d %H:%M:%S"),
                         "remark": remark,
                     })

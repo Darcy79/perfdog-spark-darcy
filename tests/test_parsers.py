@@ -318,6 +318,58 @@ class TestReportCacheLru(unittest.TestCase):
         self.assertEqual(len(server._report_cache), 0)     # 非法/失败请求不污染缓存
 
 
+class TestRunsMetaCount(unittest.TestCase):
+    """/api/runs 行数缓存对 meta 首行的处理（2026-08-26，v41 问题 2）。
+
+    v41 起 jsonl 首行是 {"event":"meta","cores":N}，旧逻辑把它计入 points，
+    历史列表"采样点数"比真实多 1。修复后 points = 行数 - (首行为 meta ? 1 : 0)。
+    """
+
+    def _list_runs_for(self, files):
+        import json as _json
+        import shutil
+        import tempfile
+        from web import WebServer
+        tmp = tempfile.mkdtemp(prefix="perfdog_runs_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        for rel, lines in files.items():
+            fp = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(fp), exist_ok=True)
+            with open(fp, "w", encoding="utf-8") as f:
+                for line in lines:
+                    f.write(_json.dumps(line, ensure_ascii=False) + "\n")
+        server = WebServer(port=0, output_dir=tmp)
+        handler_cls = server._make_handler()
+        dummy = handler_cls.__new__(handler_cls)
+        runs = handler_cls._list_runs(dummy)
+        return {r["name"]: r["points"] for r in runs}
+
+    def test_meta_line_not_counted_as_point(self):
+        got = self._list_runs_for({
+            "a/with_meta.jsonl": [
+                {"ts": 1.0, "event": "meta", "cores": 8},
+                {"ts": 1.0, "t_ms": 0, "cpu": {}},
+                {"ts": 2.0, "t_ms": 1000, "cpu": {}},
+            ],
+            "b/without_meta.jsonl": [
+                {"ts": 1.0, "t_ms": 0, "cpu": {}},
+                {"ts": 2.0, "t_ms": 1000, "cpu": {}},
+            ],
+        })
+        self.assertEqual(got["a/with_meta.jsonl"], 2)      # 3 行 - 1 meta
+        self.assertEqual(got["b/without_meta.jsonl"], 2)   # 老数据无 meta，不受影响
+
+    def test_meta_detection_tolerates_space_and_field_order(self):
+        # 首行 JSON 含空格/字段序不同，也应正确识别为 meta
+        got = self._list_runs_for({
+            "c/x.jsonl": [
+                {"cores": 4, "event": "meta", "ts": 1.0},
+                {"ts": 1.0, "t_ms": 0, "cpu": {}},
+            ],
+        })
+        self.assertEqual(got["c/x.jsonl"], 1)
+
+
 class TestMemParsers(unittest.TestCase):
     """内存 PSS/RSS 同源解析（P0-1）。"""
 
