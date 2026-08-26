@@ -98,50 +98,56 @@
   var _pinCharts = [];
   var _pinIdx = null;
 
-  // v42：判断点击是否落在 legend 区域（右上角"自选数据"）。legend 也在 canvas 内，
-  // 点击选中/取消系列会触发 DOM click → 若不拦截，_pinIndexAtPx 会把贯穿线锁到
-  // legend 所在像素（右上角）。返回 true 表示命中了 legend，应跳过锁定/解锁。
+  // v43：判断容器内坐标 (x,y) 是否落在 legend（右上角"自选数据"）区域。
   //
-  // v41 根因（已确认）：LegendModel 是 ComponentModel，不是坐标系统，没有
-  // `coordinateSystem` 属性 → `lm.coordinateSystem` 恒 undefined → rect 恒 null →
-  // 拦截完全失效。正确取法：`chart.getViewOfComponentModel(legendModel)` 拿 LegendView，
-  // 其 `group.getBoundingRect()` 返回 legend 内容包围盒（zrender 逻辑像素 = 容器 CSS 像素，
-  // ECharts 内部已处理 devicePixelRatio，无需再除）。
+  // 前两轮失败的根因（bun + echarts.min.js 5.5.0 SSR 实证，非臆测）：
+  //   v41：LegendModel 是 ComponentModel，无 coordinateSystem → rect 恒 null → 拦截恒 false。
+  //   v42：`group.transformCoordToGlobal(x, y)` 真实签名是 2 参返回数组（源码：
+  //        `transformCoordToGlobal=function(t,e){var n=[t,e];...;return n}`），v42 传 3 参
+  //        再读 out → 恒空数组 → gx=NaN → 拦截恒 false；且即便签名对，该方法**只对
+  //        transform 矩阵（旋转/缩放）生效**——而 legend group 的位置走 `group.x/y`
+  //        （实测 782,9）、`group.transform === undefined` → 原样返回局部坐标(≈-5,-5)。
   //
-  // v42 加固：getBoundingRect() 返回的是 group **局部坐标**包围盒；若 ECharts 把 legend
-  // 布局位移放在 group 自身的 x/y（transform）上，局部 rect 会偏向左上。用
-  // transformCoordToGlobal 把左上角转成 zrender 根坐标（= 容器 CSS 像素）再判定，
-  // 无该方法时回退原始坐标（zrender 4 兼容）。
-  function _hitLegend(chart, clientX, clientY) {
+  // v43 方案：几何包围盒判定，但用**正确公式**——legend 无 transform 时，
+  //   全局包围盒 = (group.x + rect.x, group.y + rect.y, rect.width, rect.height)
+  // 实证（_diag12）：该公式算出 (777.4, 4, 114.6, 23.2)，与右上角布局精确吻合。
+  // 有 transform（旋转/缩放，legend 实际不会发生）时用 2 参签名转 4 个角点兜底。
+  //
+  // 为何不用"元素树命中判定"（也实证过）：legend 项之间的空隙点击时
+  // zrender target 为 null（_diag12：包围盒内 findHover 仅命中 3/15），
+  // 元素树判定会漏掉空隙 → 蓝线仍锁到 legend 空隙像素（正是用户报障场景）。
+  // 几何包围盒覆盖整个 legend 区域（含空隙），是唯一不漏的判据。
+  function _hitLegendBox(chart, x, y) {
     try {
-      var dom = chart.getDom();
-      var r = dom.getBoundingClientRect();
-      var x = clientX - r.left;   // 容器内 CSS 像素
-      var y = clientY - r.top;
-      var model = chart.getModel();
-      // getComponent('legend', true) 返回数组；getComponent('legend') 返回单个（本工具只有一个）
-      var lm = model.getComponent ? model.getComponent('legend') : null;
+      var lm = chart.getModel().getComponent('legend');
       if (!lm) return false;
-      var view = chart.getViewOfComponentModel ? chart.getViewOfComponentModel(lm) : null;
+      var view = chart.getViewOfComponentModel(lm);
       var group = view && view.group;
-      var rect = group && group.getBoundingRect ? group.getBoundingRect() : null;
+      if (!group) return false;
+      var rect = group.getBoundingRect();
       if (!rect) return false;
-      // 局部坐标 → zrender 全局坐标（含 group 位移/缩放）
-      var gx = rect.x, gy = rect.y;
-      if (group.transformCoordToGlobal) {
-        var pt = [];
-        try {
-          group.transformCoordToGlobal(rect.x, rect.y, pt);
-          if (pt && pt.length >= 2 && isFinite(pt[0]) && isFinite(pt[1])) {
-            gx = pt[0]; gy = pt[1];
-          }
-        } catch (e) {}
+      var gx, gy, gw, gh;
+      if (group.transform) {
+        // 仅旋转/缩放时走此分支（正确 2 参签名，返回 [gx,gy]）；转 4 角点取外接矩形
+        var xs = [], ys = [];
+        [[rect.x, rect.y], [rect.x + rect.width, rect.y],
+         [rect.x, rect.y + rect.height], [rect.x + rect.width, rect.y + rect.height]]
+          .forEach(function (pt) {
+            var g = group.transformCoordToGlobal(pt[0], pt[1]);
+            if (g && isFinite(g[0]) && isFinite(g[1])) { xs.push(g[0]); ys.push(g[1]); }
+          });
+        if (!xs.length) return false;
+        gx = Math.min.apply(null, xs); gy = Math.min.apply(null, ys);
+        gw = Math.max.apply(null, xs) - gx; gh = Math.max.apply(null, ys) - gy;
+      } else {
+        // 常见情形：legend 仅平移（位置在 group.x/y，无 transform 矩阵）→ 直接相加
+        gx = group.x + rect.x; gy = group.y + rect.y;
+        gw = rect.width; gh = rect.height;
       }
-      // 保守加 4px 容差：legend 换行/贴边时点击紧邻空白也算命中
+      // 4px 容差：覆盖 legend 贴边/换行的紧邻空白
       var pad = 4;
-      var L = gx - pad, T = gy - pad,
-          R = (gx + rect.width) + pad, B = (gy + rect.height) + pad;
-      return x >= L && x <= R && y >= T && y <= B;
+      return x >= gx - pad && x <= gx + gw + pad &&
+             y >= gy - pad && y <= gy + gh + pad;
     } catch (e) {}
     return false;
   }
@@ -167,13 +173,19 @@
 
       if (getComputedStyle(dom).position === 'static') dom.style.position = 'relative';
 
+      // v43：事件链路不变（DOM click/dblclick，与 v42 及更早版本一致，
+      // 保留"点空白也能锁定"等既有行为），仅把 legend 判定从"包围盒坐标变换"
+      // 换成几何包围盒公式修正版 _hitLegendBox（v41/v42 均因坐标换算错误而失效）。
       dom.addEventListener('click', function (e) {
         var x = e.clientX, y = e.clientY;
-        // v41：点击 legend（右上角自选数据）时不锁定/解锁贯穿线，避免把蓝线锁到 legend 位置
-        if (_hitLegend(chart, x, y)) { console.log('[PerfDog] 点击 legend → 跳过贯穿线锁定'); return; }
         var r = dom.getBoundingClientRect();
-        var localX = x - r.left;      // 容器内像素 x（所见即所点的位置）
-        var idx = _pinIndexAtPx(chart, dom, x, y);
+        var localX = x - r.left;      // 容器内像素（所见即所点，与包围盒同一坐标系）
+        var localY = y - r.top;
+        if (_hitLegendBox(chart, localX, localY)) {
+          console.log('[PerfDog] 点击 legend → 跳过贯穿线锁定');
+          return;
+        }
+        var idx = _pinIndexAtLocal(chart, dom, localX, localY);
         console.log('[PerfDog] 点击 x=' + Math.round(x) + ' y=' + Math.round(y) +
                     ' → idx=' + idx + ' localX=' + Math.round(localX));
         if (idx === null || idx < 0) return;
@@ -184,10 +196,8 @@
     });
   }
 
-  function _pinIndexAtPx(chart, dom, clientX, clientY) {
-    var r = dom.getBoundingClientRect();
-    var x = clientX - r.left;
-    var y = clientY - r.top;
+  function _pinIndexAtLocal(chart, dom, x, y) {
+    // x/y 为容器内坐标（v42 前用 clientX-rect.left，本质相同）
     try {
       var pt = chart.convertFromPixel({ xAxisIndex: 0 }, [x, y]);
       if (pt && typeof pt[0] === 'number' && isFinite(pt[0])) {
@@ -198,10 +208,11 @@
       }
     } catch (e) {}
     // 比例兜底：类目大致均匀分布
-    var cats = ((chart.getOption().xAxis || [{}])[0] || {}).data || [];
-    if (!cats.length || r.width <= 0) return null;
-    var idx2 = Math.round(x / r.width * cats.length);
-    return Math.max(0, Math.min(idx2, cats.length - 1));
+    var r = dom.getBoundingClientRect();
+    var cats2 = ((chart.getOption().xAxis || [{}])[0] || {}).data || [];
+    if (!cats2.length || r.width <= 0) return null;
+    var idx2 = Math.round(x / r.width * cats2.length);
+    return Math.max(0, Math.min(idx2, cats2.length - 1));
   }
 
   function _pinLockAll(idx, pxX) {
