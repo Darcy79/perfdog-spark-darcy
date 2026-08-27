@@ -28,6 +28,7 @@ from metrics.mem import MemCollector
 from metrics.network import NetworkCollector
 from metrics.thermal import ThermalCollector
 from logcat import LogcatMonitor
+from data_health import check_rows_live
 
 # 各指标独立采样间隔（秒）。FPS 高频（0.5s）让 Jank 及时出现；
 # 内存/温度低频（2s）避免 dumpsys 拖慢整体。并行后互不阻塞。
@@ -285,6 +286,9 @@ def main():
     # 设备断连诊断（2026-08-21）：连续 N 轮多数指标报错 → 探活 adb devices 醒目告警
     fail_streak = 0
     diag_shown = False
+    # 数据健全性实时自检（2026-08-27）：每轮对当前快照跑轻量规则，连续命中才告警，
+    # 复用断连告警的"连续 N 轮才提醒"思路，避免单点噪声刷屏
+    health_streak = {}
     with open(out_file, "w", encoding="utf-8") as f:
         # meta 行（2026-08-26）：首行写入核数等采集元信息，供历史报告读取核数，
         # 不依赖当前是否连接设备。event 行不参与采样点统计（前端 prepareRows 过滤）。
@@ -328,6 +332,11 @@ def main():
                     diag_shown = False
                     if web:
                         web.set_status(running=True, device=adb.serial)
+
+            # 数据健全性实时自检：只跑关键规则（RSS<PSS / 采错进程线索），连续命中才告警
+            health_alerts, health_streak = check_rows_live(row, health_streak)
+            for msg in health_alerts:
+                print(f"[!] 数据健全性告警: {msg}", flush=True)
 
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()

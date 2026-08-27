@@ -21,6 +21,8 @@ import json
 import os
 import sys
 
+from data_health import scan_rows, health_summary
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(SCRIPT_DIR, "..", "web")
 ASSETS_DIR = os.path.join(WEB_DIR, "assets")
@@ -145,6 +147,26 @@ def export_html(rows, out_path, events=None):
 
     cores = extract_cores(rows)      # 从 meta 行读核数（供 CPU 图"进程占整机%"）
     rows = data_rows(rows)           # 过滤 meta/target_switch 事件行
+    # 数据健全性自检（2026-08-27）：扫描整份数据，异常注入报告顶部提示条
+    health_issues = scan_rows(rows)
+    health_text = health_summary(health_issues)
+    health_banner = ""
+    if health_issues:
+        n_issues = len(health_issues)
+        # 分级着色：high（疑似采错进程）红色，其余黄色
+        has_high = any(it.get("level") == "high" for it in health_issues)
+        color = "#ef5350" if has_high else "#ffab40"
+        health_banner = (
+            '<div class="health-banner" style="'
+            'display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center;'
+            'margin:10px 0;padding:8px 12px;border-radius:6px;'
+            f'background:rgba(239,83,80,.12);border:1px solid {color};color:#e3f2fd;'
+            'font-size:12px;line-height:1.5;">'
+            f'<strong style="color:{color};">⚠️ 数据健全性提示：{n_issues} 项</strong>'
+            f'<span>{health_text}</span>'
+            '<span style="opacity:.6;">（自动检测，仅供参考——单点高不等于全程异常）</span>'
+            '</div>'
+        )
     echarts = read(os.path.join(ASSETS_DIR, "echarts.min.js"))
     appjs = read(os.path.join(ASSETS_DIR, "app.js"))
     style = read(os.path.join(ASSETS_DIR, "style.css"))
@@ -185,6 +207,7 @@ def export_html(rows, out_path, events=None):
 </header>
 <main>
   <div class="summary" id="report-summary"></div>
+  {health_banner}
   <section class="chart-card"><div class="chart-head"><h2>FPS / Jank</h2><div id="stat-fps" class="stat-line"></div></div><div id="chart-fps" class="chart"></div></section>
   <section class="chart-card"><div class="chart-head"><h2>帧时间 (ms)</h2><div id="stat-frametime" class="stat-line"></div></div><div id="chart-frametime" class="chart"></div></section>
   <section class="chart-card"><div class="chart-head"><h2>CPU 占用</h2><div id="stat-cpu" class="stat-line"></div></div><div id="chart-cpu" class="chart"></div></section>
