@@ -44,6 +44,18 @@ DEFAULT_REFRESH_NS = 16_666_666
 # 实测荣耀设备缓冲末位常驻 INT64_MAX 哨兵
 MAX_VALID_TS = 10 ** 17
 
+# ---- Jank 阈值节奏校准（2026-08-27 kimi 归因修复）----
+# 现象：荣耀面板支持 60/90/120/144Hz，微信小游戏被平台锁 60fps；若 --latency
+# 首行按面板当前 vsync 报 120Hz（8.33ms），阈值 = 2×8.33 = 16.67ms，而 60fps
+# 帧间隔正好 ~16.7ms → 亚毫秒抖动就跨线 → 假 Jank 70-100%（实测 hz=120 段
+# Jank 78.6% vs hz=60 段 3.9%）。
+# 修复：新帧 ≥MIN 时用 gaps 中位数作"实际呈现节奏"，吸附最近标准 vsync 档
+# （10% 容差），阈值 = 2×节奏×1.1；新帧不足回退 refresh_ns 口径。
+_VSYNC_STANDARDS_MS = (16.6667, 11.1111, 8.3333, 6.9444)  # 60/90/120/144Hz
+JANK_RHYTHM_TOLERANCE = 1.1      # 阈值 = 2×节奏×1.1（亚毫秒抖动容差）
+JANK_RHYTHM_SNAP = 0.10          # 吸附标准档的容差（10%）
+MIN_FRAMES_FOR_RHYTHM = 8        # 新帧数下限，不足回退 refresh_ns 口径
+
 
 class FpsCollector:
     def __init__(self, adb, package, process_pattern="appbrand",
@@ -269,6 +281,26 @@ class FpsCollector:
                     timestamps.append(v)
         return refresh, timestamps
 
+    def _jank_threshold_ns(self, new_ts):
+        """按实际呈现节奏校准 Jank 阈值（2026-08-27 修复假 Jank）。
+
+        新帧 ≥MIN_FRAMES_FOR_RHYTHM 时：gaps 中位数 = 实际渲染节奏，吸附最近
+        标准 vsync 档（60/90/120/144Hz，10% 容差内才吸附，防真高刷被错吸到
+        低档），阈值 = 2×节奏×1.1。新帧不足回退 self.refresh_ns×2（现有口径）。
+        返回阈值（ns）。
+        """
+        if len(new_ts) < MIN_FRAMES_FOR_RHYTHM:
+            return self.refresh_ns * JANK_MULTIPLIER
+        gaps_ms = sorted((new_ts[i] - new_ts[i - 1]) / 1e6
+                         for i in range(1, len(new_ts)))
+        med = gaps_ms[len(gaps_ms) // 2]
+        rhythm = med
+        for std in _VSYNC_STANDARDS_MS:
+            if abs(med - std) / std <= JANK_RHYTHM_SNAP:
+                rhythm = std
+                break
+        return rhythm * JANK_MULTIPLIER * JANK_RHYTHM_TOLERANCE * 1e6  # ns
+
     def sample(self, ts):
         # gfx 通道（普通 View 应用）优先走增量
         if self.mode == "gfx":
@@ -338,7 +370,7 @@ class FpsCollector:
             else [t for t in timestamps if t > self._last_seen_ts]
         if timestamps:
             self._last_seen_ts = timestamps[-1]
-        jank_threshold = self.refresh_ns * JANK_MULTIPLIER
+        jank_threshold = self._jank_threshold_ns(new_ts)   # 节奏校准阈值（2026-08-27）
         if len(new_ts) >= 2:
             gaps = [new_ts[i] - new_ts[i - 1] for i in range(1, len(new_ts))]
             over = sum(1 for g in gaps if g > jank_threshold)

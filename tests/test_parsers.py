@@ -674,5 +674,66 @@ class TestProbeCores(unittest.TestCase):
         self.assertEqual(CpuCollector.probe_cores(adb2), 8)
 
 
+class TestJankRhythmThreshold(unittest.TestCase):
+    """Jank 阈值节奏校准（2026-08-27 kimi 归因修复）。
+
+    面板 120Hz 但游戏锁 60fps 时，refresh_ns 口径阈值 16.67ms 与帧间隔 16.7ms
+    压线误判假 Jank；改为按实际帧间隔中位数吸附标准 vsync 档（60/90/120/144Hz）。
+    """
+
+    def _make(self, refresh_ns=8_333_333):
+        from metrics.fps import FpsCollector
+        c = FpsCollector.__new__(FpsCollector)   # 跳过 __init__（无 adb）
+        c.refresh_ns = refresh_ns
+        return c
+
+    def _ts(self, gap_ns, count):
+        # 生成 count+1 个时间戳，间隔 gap_ns（带 ±2% 抖动）
+        import random
+        out = []
+        t = 1_000_000_000
+        for _ in range(count):
+            out.append(t)
+            t += int(gap_ns * random.uniform(0.98, 1.02))
+        return out
+
+    def test_60fps_on_120hz_panel_no_false_jank(self):
+        # 60fps 帧间隔 ~16.7ms，面板 refresh=120Hz：旧口径阈值 16.67ms 全误判
+        c = self._make(refresh_ns=8_333_333)
+        new_ts = self._ts(16_666_666, 30)
+        thr = c._jank_threshold_ns(new_ts)
+        self.assertGreater(thr, 33_000_000)          # 阈值≈36.7ms（16.67×2×1.1）
+        over = sum(1 for i in range(1, len(new_ts))
+                   if new_ts[i] - new_ts[i - 1] > thr)
+        self.assertEqual(over, 0)                     # 正常帧不再被误判为 Jank
+
+    def test_real_120hz_game_threshold_basically_unchanged(self):
+        c = self._make(refresh_ns=8_333_333)
+        new_ts = self._ts(8_333_333, 30)
+        thr = c._jank_threshold_ns(new_ts)
+        self.assertAlmostEqual(thr / 1e6, 8.3333 * 2 * 1.1, delta=1.0)  # ≈18.3ms
+
+    def test_60fps_on_144hz_panel(self):
+        # 144Hz 面板锁 60fps：间隔 16.7ms 吸附 60Hz 档，不误判
+        c = self._make(refresh_ns=6_944_444)
+        new_ts = self._ts(16_666_666, 30)
+        thr = c._jank_threshold_ns(new_ts)
+        self.assertGreater(thr, 33_000_000)
+
+    def test_few_frames_falls_back_to_refresh(self):
+        # 新帧 <8 → 回退 refresh_ns×2
+        c = self._make(refresh_ns=8_333_333)
+        new_ts = self._ts(16_666_666, 5)
+        thr = c._jank_threshold_ns(new_ts)
+        self.assertAlmostEqual(thr / 1e6, 8.3333 * 2, delta=0.1)   # 16.67ms
+
+    def test_locked_30fps_not_snapped(self):
+        # 锁 30fps：间隔 ~33.3ms 不吸附任何标准档（容差 10%），阈值放宽到 73ms
+        c = self._make(refresh_ns=8_333_333)
+        new_ts = self._ts(33_333_333, 30)
+        thr = c._jank_threshold_ns(new_ts)
+        self.assertGreater(thr / 1e6, 60)            # >60ms
+
+
 if __name__ == "__main__":
     unittest.main()
