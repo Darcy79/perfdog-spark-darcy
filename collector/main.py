@@ -288,10 +288,13 @@ def main():
     with open(out_file, "w", encoding="utf-8") as f:
         # meta 行（2026-08-26）：首行写入核数等采集元信息，供历史报告读取核数，
         # 不依赖当前是否连接设备。event 行不参与采样点统计（前端 prepareRows 过滤）。
+        # 2026-08-27：加 proc_name（本次匹配到的进程名），事后可核对采集对象
+        # （多 appbrand 进程并存时确认采到的是活跃进程）。
         f.write(json.dumps({
             "ts": round(time.time(), 3),
             "event": "meta",
             "cores": cores,
+            "proc_name": getattr(resolver, "proc_name", None) or package,
         }, ensure_ascii=False) + "\n")
         while not stop["flag"]:
             ts = time.time()

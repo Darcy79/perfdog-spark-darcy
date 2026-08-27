@@ -20,6 +20,7 @@ class PidResolver:
         self.package = package
         self.process_pattern = process_pattern
         self.pid = None
+        self.proc_name = None   # 匹配到的进程名（jsonl meta 记录用，事后可核对采集对象）
         self._next_check = 0.0   # 下一次允许校验的时间点（性能优化 2026-08-12）
         self._check_interval = 5.0  # 校验周期：避免每轮采样都 cat comm 多一次往返
         # 期望进程名（comm 校验用）：优先 process_pattern；无则用包名最后一段
@@ -28,7 +29,14 @@ class PidResolver:
         self._expect = process_pattern or package.rsplit(".", 1)[-1]
 
     def resolve(self):
-        """重新解析目标进程 pid，找不到返回 None（带 5s 失败节流）。"""
+        """重新解析目标进程 pid，找不到返回 None（带 5s 失败节流）。
+
+        多候选（2026-08-27 真机发现：微信多开/驻留导致多个 appbrand 进程并存，
+        如 appbrand0/1/2 同时存在）：取**累计 CPU 时间最大**（utime+stime）的进程。
+        闲置驻留进程 CPU 极小（实测 18.6h 仅 38.8s），真正渲染小游戏的进程 CPU 大
+        （实测 1476s）；旧逻辑取 ps 列表第一个（pid 最小）会采到闲置进程，
+        导致 cpu/mem/net 全部采错进程（8/27 数据作废事故）。
+        """
         # 失败节流：上次解析失败后 5s 内不再重复打命令（3 个采集线程共享实例，
         # 不加节流会以 ~3次/s 高频轰炸 adb）
         if self.pid is None and time.time() < self._next_check:
@@ -36,21 +44,53 @@ class PidResolver:
         pids = self._list_pids()
         if not pids:
             self.pid = None
+            self.proc_name = None
             self._next_check = time.time() + 5.0
             return None
         if self.process_pattern:
-            for pid, name in pids:
-                if self.process_pattern in name:
-                    self.pid = pid
-                    return self.pid
+            cands = [c for c in pids if self.process_pattern in c[1]]
+            if cands:
+                chosen = self._pick_active(cands)
+                self.pid, self.proc_name = chosen
+                return self.pid
             # 未匹配到子进程 → 回退主进程（包名匹配）
         for pid, name in pids:
             if self.package in name:
                 self.pid = pid
+                self.proc_name = name
                 return self.pid
         self.pid = None
+        self.proc_name = None
         self._next_check = time.time() + 5.0
         return None
+
+    def _pick_active(self, cands):
+        """多候选中选累计 CPU 时间最大的（utime+stime），返回 (pid, name)。
+
+        候选通常 1~3 个；一次 `cat /proc/PID/stat ...` 拿全部（一次 adb 往返）。
+        全部解析失败时回退第一个候选（兼容旧行为）。
+        """
+        if len(cands) <= 1:
+            return cands[0]
+        pids = [str(c[0]) for c in cands]
+        try:
+            out = self.adb.shell(["cat"] + [f"/proc/{p}/stat" for p in pids])
+        except Exception:
+            return cands[0]
+        best, best_ticks = cands[0], -1
+        for line in out.splitlines():
+            if ")" not in line:
+                continue
+            try:
+                after = line[line.rfind(")") + 1:].split()
+                ticks = int(after[11]) + int(after[12])   # 原字段 14=utime 15=stime
+                pid = int(line.split("(", 1)[0].strip())
+            except (ValueError, IndexError):
+                continue
+            if ticks > best_ticks:
+                best = next((c for c in cands if c[0] == pid), best)
+                best_ticks = ticks
+        return best
 
     def _list_pids(self):
         """单次 ps 拿全部进程 (pid, name)。优先 `ps -A -o PID,ARGS`（完整命令行），

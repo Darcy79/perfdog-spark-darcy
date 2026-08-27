@@ -37,11 +37,21 @@ class CpuCollector:
 
     @staticmethod
     def probe_cores(adb, default=8):
-        """探测设备 CPU 核数（`adb shell nproc`，失败兜底 default）。
+        """探测设备 CPU 核数，供前端派生曲线"进程占整机% = cpu_proc_pct ÷ 核数"。
 
-        用于前端派生曲线"进程占整机% = cpu_proc_pct ÷ 核数"。nproc 是 Android
-        toybox 自带命令，绝大多数设备可用；个别精简系统缺失或返回异常时兜底。
+        优先级（2026-08-27 修正）：`/sys/devices/system/cpu/online`（物理核数，
+        内容如 "0-7"）→ `nproc`（toybox 自带，但 shell 被 cpuset 限制时会少报，
+        实测 8 核设备只报 6）→ 兜底 default。
         """
+        # 1) /sys/devices/system/cpu/online：物理核数，格式 "0-7" / "0,2-7" / "-7" / "3"
+        try:
+            out = adb.shell(["cat", "/sys/devices/system/cpu/online"])
+            v = CpuCollector._parse_cpu_online(out)
+            if v:
+                return v
+        except Exception:
+            pass
+        # 2) nproc（cpuset 可能少报，作次级回退）
         try:
             out = adb.shell(["nproc"])
             v = int(out.strip())
@@ -50,6 +60,31 @@ class CpuCollector:
         except Exception:
             pass
         return default
+
+    @staticmethod
+    def _parse_cpu_online(out):
+        """解析 /sys/devices/system/cpu/online 得核数；失败返回 None。
+
+        "0-7"→8、"-7"→8（省略下界=0）、"0,2-7"→8、"3"→4。
+        """
+        if not out:
+            return None
+        max_idx = -1
+        try:
+            for part in out.strip().replace(" ", "").split(","):
+                if not part:
+                    continue
+                if "-" in part:
+                    lo, hi = part.split("-", 1)
+                    lo = int(lo) if lo else 0      # "-7" 表示 0-7
+                    hi = int(hi)
+                else:
+                    lo = hi = int(part)
+                if hi > max_idx:
+                    max_idx = hi
+        except (ValueError, TypeError):
+            return None
+        return max_idx + 1 if max_idx >= 0 else None
 
     def sample(self, ts):
         pid = self.pid_resolver.current_pid(ts)

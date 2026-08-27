@@ -601,5 +601,78 @@ class TestPidResolverParsing(unittest.TestCase):
         self.assertEqual(got, 5838)     # comm 不符 → 重新解析到 appbrand 子进程
 
 
+class TestPidResolverActivePick(unittest.TestCase):
+    """多 appbrand 候选选最活跃进程（2026-08-27 P0 修复）。
+
+    微信多开/驻留时 appbrand0/1/2 并存，旧逻辑取 ps 第一个（pid 最小）会采到
+    闲置驻留进程；修复后按 /proc/<pid>/stat 的 utime+stime 选累计 CPU 最大者。
+    """
+
+    def test_multiple_candidates_picks_most_active(self):
+        adb = MockAdb({
+            "ps -A -o PID,ARGS":
+                "PID ARGS\n"
+                "100 /system/bin/surfaceflinger\n"
+                "11715 com.tencent.mm:appbrand2\n"
+                "18186 com.tencent.mm:appbrand1\n"
+                "18243 com.tencent.mm:appbrand0\n",
+            # cat 三个候选 stat：appbrand2 闲置（38s），appbrand1 活跃（1476s）
+            "cat /proc/11715/stat /proc/18186/stat /proc/18243/stat":
+                "11715 (com.tencent.mm:appbrand2) S 1 2 3 4 5 6 7 8 9 10 11 2000 1800 0 0\n"
+                "18186 (com.tencent.mm:appbrand1) S 1 2 3 4 5 6 7 8 9 10 11 80000 67600 0 0\n"
+                "18243 (com.tencent.mm:appbrand0) S 1 2 3 4 5 6 7 8 9 10 11 5000 4000 0 0\n",
+        })
+        r = PidResolver(adb, "com.tencent.mm", "appbrand")
+        pid = r.resolve()
+        self.assertEqual(pid, 18186)                    # 选 CPU 时间最大的 appbrand1
+        self.assertIn("appbrand1", r.proc_name or "")
+
+    def test_single_candidate_no_extra_read(self):
+        # 只有一个候选时不额外读 stat（len(cands)<=1 直接返回）
+        adb = MockAdb({
+            "ps -A -o PID,ARGS":
+                "PID ARGS\n100 /system/bin/surfaceflinger\n1697 com.tencent.mm:appbrand0\n",
+        })
+        r = PidResolver(adb, "com.tencent.mm", "appbrand")
+        pid = r.resolve()
+        self.assertEqual(pid, 1697)
+        # MockAdb 未配置 "cat /proc/..." 响应，若被调用会抛 AssertionError → 到不了这行
+
+
+class TestProbeCores(unittest.TestCase):
+    """核数探测：/sys/devices/system/cpu/online 优先（2026-08-27 P1 修复）。
+
+    旧实现只 nproc，被 cpuset 限制时会少报（8 核报 6）；online 反映物理核数。
+    """
+
+    def test_parse_cpu_online_variants(self):
+        from metrics.cpu import CpuCollector
+        cases = {
+            "0-7": 8, "-7": 8, "0,2-7": 8, "3": 4,
+            "0-3\n": 4, " 0-5 ": 6, "0-1,3-5": 6, "": None, "abc": None,
+        }
+        for raw, expect in cases.items():
+            got = CpuCollector._parse_cpu_online(raw)
+            self.assertEqual(got, expect, f"online={raw!r} → {got}（期望 {expect}）")
+
+    def test_probe_cores_prefers_sysfs(self):
+        # online 可读 → 用物理核数 8，即使 nproc 只报 6（cpuset 限制）
+        adb = MockAdb({
+            "cat /sys/devices/system/cpu/online": "0-7\n",
+            "nproc": "6\n",
+        })
+        from metrics.cpu import CpuCollector
+        self.assertEqual(CpuCollector.probe_cores(adb), 8)
+
+    def test_probe_cores_falls_back_to_nproc_then_default(self):
+        from metrics.cpu import CpuCollector
+        # online 读失败 → nproc
+        adb1 = MockAdb({"nproc": "4\n"})
+        self.assertEqual(CpuCollector.probe_cores(adb1), 4)
+        # online 与 nproc 都失败 → default
+        adb2 = MockAdb({})
+        self.assertEqual(CpuCollector.probe_cores(adb2), 8)
+
+
 if __name__ == "__main__":
     unittest.main()
