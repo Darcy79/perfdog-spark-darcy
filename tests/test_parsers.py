@@ -19,7 +19,7 @@ _COLLECTOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "col
 if _COLLECTOR not in sys.path:
     sys.path.insert(0, _COLLECTOR)
 
-from metrics.fps import FpsCollector, MAX_VALID_TS
+from metrics.fps import FpsCollector, MAX_VALID_TS, _main_segment, FPS_SEGMENT_GAP_NS
 from metrics.mem import parse_smaps_rollup, parse_meminfo
 from metrics.cpu import CpuCollector
 from metrics.thermal import ThermalCollector
@@ -184,6 +184,121 @@ class TestFpsLayerSwitch(unittest.TestCase):
         r4 = c.sample(4.0)
         self.assertEqual(r4["layer"], self.L1)
         self.assertEqual(r4["frame_p50_ms"], 16.67)
+
+
+class TestFpsSparseSegment(unittest.TestCase):
+    """OPPO 稀疏缓冲修复（2026-09-01）：按大 gap 切段取主段算 FPS。
+
+    现象：OPPO ded7a388 的 SF --latency 缓冲 128 帧时间戳稀疏分布在约 35 分钟里
+    （相邻帧间隔中位 16.7ms），旧版全缓冲首尾跨度算出 127/2108s ≈ 0.06 → 显示 0.01；
+    修复后取帧数最多的密集主段，FPS 反映当前真实渲染节奏。
+    """
+
+    L = "SurfaceView[com.tencent.mm:appbrand0/AppUI]#776(BLAST)"
+
+    @staticmethod
+    def _latency_from_ts(tss, refresh_ns=16666666):
+        out = f"{refresh_ns}\n"
+        for t in tss:
+            out += f"{t}\t{t}\t{t}\n"
+        return out
+
+    def _collector(self, adb):
+        return FpsCollector(adb, "com.tencent.mm", "appbrand", retry_interval=0.0)
+
+    # ---------- _main_segment 纯函数 ----------
+
+    def test_segment_empty_and_single(self):
+        self.assertEqual(_main_segment([]), [])
+        self.assertEqual(_main_segment([100]), [100])
+
+    def test_segment_contiguous_is_single(self):
+        tss = [i * 16_666_666 for i in range(128)]
+        self.assertEqual(_main_segment(tss), tss)
+
+    def test_segment_picks_densest(self):
+        # 段 1：2 帧；大 gap；段 2：5 帧（密集）→ 取段 2
+        tss = [0, 16_000_000,
+               10_000_000_000,
+               20_000_000_000, 20_016_000_000, 20_032_000_000,
+               20_048_000_000, 20_064_000_000]
+        seg = _main_segment(tss)
+        self.assertEqual(seg, tss[3:])
+
+    def test_segment_tie_takes_later(self):
+        # 两段各 2 帧并列 → 取靠后段（更接近当前节奏）
+        tss = [0, 16_000_000, 5_000_000_000, 5_016_000_000]
+        seg = _main_segment(tss)
+        self.assertEqual(seg, tss[2:])
+
+    def test_segment_jank_gap_does_not_split(self):
+        # 300ms 真实卡顿 < 0.5s 阈值 → 不切段，主段含全部帧
+        step = 16_666_666
+        tss = [0, step, step * 2, step * 2 + 300_000_000, step * 2 + 300_000_000 + step]
+        seg = _main_segment(tss)
+        self.assertEqual(seg, tss)
+
+    # ---------- sample() 端到端 ----------
+
+    def test_sparse_buffer_fps_uses_main_segment(self):
+        """OPPO 场景：孤立帧 + 2000s 大 gap + 127 帧密集段。
+
+        修复后 FPS = 126 帧 ÷ (126×16.67ms) = 60.0；
+        旧版全跨度 = 127 ÷ 2002.1s ≈ 0.06（病态低值）。
+        """
+        step = 16_666_666
+        t0 = 1_000_000_000_000
+        gap_ns = 2_000 * 1_000_000_000            # 2000s，远超 0.5s 切段阈值
+        tss = [t0] + [t0 + gap_ns + i * step for i in range(127)]
+        adb = SfMockAdb(self.L, self._latency_from_ts(tss))
+        c = self._collector(adb)
+        r = c.sample(1.0)
+        self.assertEqual(r["total_frames"], 128)
+        # 主段 = 后 127 帧，首尾跨度 = 126×16.67ms ≈ 2.1s → FPS ≈ 60.0
+        self.assertEqual(r["fps"], 60.0)
+        self.assertEqual(r["frame_p50_ms"], 16.67)   # 帧时间统计不受影响
+
+    def test_contiguous_buffer_unchanged(self):
+        """荣耀回归保护：128 帧连续缓冲 → 单段，行为与修复前完全一致。"""
+        adb = SfMockAdb(self.L, sf_latency(1_000_000_000_000, 128, 16_666_666))
+        c = self._collector(adb)
+        r = c.sample(1.0)
+        self.assertEqual(r["total_frames"], 128)
+        self.assertEqual(r["fps"], 60.0)   # 127 ÷ (127×16.67ms)
+
+    def test_main_segment_only_isolated_frame(self):
+        """缓冲内每帧间隔都 >0.5s → 每段仅 1 帧 → 无可测节奏，FPS=0。"""
+        tss = [0, 1_000_000_000, 2_000_000_000]   # 间隔 1s
+        adb = SfMockAdb(self.L, self._latency_from_ts(tss))
+        c = self._collector(adb)
+        r = c.sample(1.0)
+        self.assertEqual(r["fps"], 0.0)
+
+    def test_stale_semantics_preserved(self):
+        """静止判断不受切段影响：缓冲无新帧推进 → fps=0 + stale=True。"""
+        adb = SfMockAdb(self.L, sf_latency(1_000_000_000_000, 8, 16_666_666))
+        c = self._collector(adb)
+        r1 = c.sample(1.0)
+        self.assertGreater(r1["fps"], 0)
+        r2 = c.sample(2.0)                          # 同一缓冲，无推进
+        self.assertEqual(r2["fps"], 0.0)
+        self.assertTrue(r2.get("stale"))
+
+    def test_pause_resume_reflects_new_rhythm(self):
+        """暂停恢复：恢复后新段是当前节奏，FPS 不被暂停间隙拉低。"""
+        step = 16_666_666
+        # 首轮：正常 8 帧
+        adb = SfMockAdb(self.L, sf_latency(1_000_000_000_000, 8, step))
+        c = self._collector(adb)
+        r1 = c.sample(1.0)
+        self.assertEqual(r1["fps"], 60.0)
+        # 暂停 30s 后恢复：缓冲里旧段 8 帧 + 新段 8 帧（30s gap 切开）
+        base2 = 1_000_000_000_000 + 7 * step + 30_000_000_000
+        tss = [1_000_000_000_000 + i * step for i in range(8)] + \
+              [base2 + i * step for i in range(8)]
+        adb.latency = self._latency_from_ts(tss)
+        r2 = c.sample(2.0)
+        self.assertEqual(r2["fps"], 60.0)   # 主段 = 恢复后的 8 帧（并列取靠后段）
 
 
 class TestExportFpsSource(unittest.TestCase):

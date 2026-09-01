@@ -15,8 +15,10 @@
      （部分设备单列，兼容处理）；帧时间戳取第 2 列
   3) 数据清洗：0 = 空槽位；实测此设备缓冲末位常驻哨兵值
      INT64_MAX (9223372036854775807)，必须过滤，否则 span 会算出天文数字
-  4) FPS = (帧数-1) ÷ (首末帧时间戳跨度) —— 基于缓冲内时间戳直接算，
-     对滚动缓冲/满槽稳定（增量法在缓冲满时会恒 0）
+  4) FPS = 按大 gap 切段后取帧数最多的主段，(帧数-1) ÷ (主段首末时间戳跨度)
+     （2026-09-01）：OPPO 等机型 SF 缓冲 128 帧时间戳稀疏分布在约 35 分钟里，
+     全缓冲首尾跨度会算出病态低值（实测显示 0.01）；连续缓冲（如荣耀）全缓冲
+     即单段，结果不变。对滚动缓冲/满槽稳定（增量法在缓冲满时会恒 0）
   5) 新鲜度：比较缓冲最新帧时间戳是否推进——持续渲染则单调前移，静止/暂停不变
      → FPS 归零（不需要 --latency-clear，避免 clear 后窗口内无帧导致的间歇性 0）
   6) Jank 率 = 相邻帧间隔 > 2×刷新周期 的占比（PerfDog 同口径，
@@ -43,6 +45,42 @@ DEFAULT_REFRESH_NS = 16_666_666
 # 缓冲内有效时间戳上限（ns，>3 年视为哨兵/异常值）：
 # 实测荣耀设备缓冲末位常驻 INT64_MAX 哨兵
 MAX_VALID_TS = 10 ** 17
+
+# ---- FPS 切段阈值（2026-09-01 OPPO 修复，供真机调参）----
+# OPPO ded7a388 实测：SF --latency 缓冲的 128 帧时间戳**稀疏分布在约 35 分钟**里
+# （相邻帧间隔中位仍 16.7ms，帧时间统计正常），全跨度 span 法算出
+# 127/2108s ≈ 0.06 → FPS 显示病态低值 0.01。
+# 修复：相邻帧间隔超过此阈值的处切段，取**帧数最多的主段**算 FPS：
+#   - 荣耀等连续缓冲（128 帧 ≈ 2.13s）→ 单段，结果与修复前完全一致
+#   - 真实卡顿（100–500ms gap）低于阈值不切段，主段含卡顿帧 → FPS 略降（合理）
+#   - 暂停（>0.5s gap）切段，恢复后主段是新段 → FPS 反映当前节奏
+#     （顺带修复"暂停恢复后 span 跨暂停间隙导致 FPS 偏低"）
+# 0.5s ≈ 60fps 下缺 30 帧，远超"渲染节奏"尺度，不会误切正常抖动。
+FPS_SEGMENT_GAP_NS = 500_000_000
+
+
+def _main_segment(timestamps):
+    """按相邻间隔 > FPS_SEGMENT_GAP_NS 切段，返回帧数最多的段（时间戳连续切片）。
+
+    帧数并列时取靠后的段（更接近当前渲染节奏）。空输入返回 []。
+    """
+    if not timestamps:
+        return []
+    segments = []
+    cur = [timestamps[0]]
+    for t in timestamps[1:]:
+        if t - cur[-1] > FPS_SEGMENT_GAP_NS:
+            segments.append(cur)
+            cur = [t]
+        else:
+            cur.append(t)
+    segments.append(cur)
+    best = segments[0]
+    for seg in segments[1:]:
+        if len(seg) >= len(best):      # >=：并列取靠后段
+            best = seg
+    return best
+
 
 # ---- Jank 阈值节奏校准（2026-08-27 kimi 归因修复）----
 # 现象：荣耀面板支持 60/90/120/144Hz，微信小游戏被平台锁 60fps；若 --latency
@@ -366,11 +404,18 @@ class FpsCollector:
         advancing = bool(cur_max is not None and self._last_max_ts is not None
                          and cur_max > self._last_max_ts)
 
-        # FPS：基于缓冲内时间戳跨度（对滚动/满槽稳定）；静止时归零
+        # FPS：按大 gap 切段，取帧数最多的主段用跨度算（2026-09-01 OPPO 修复）。
+        # 背景：OPPO 的 SF 缓冲 128 帧时间戳稀疏分布在约 35 分钟里，旧版全缓冲
+        # 首尾跨度算出病态低值（127/2108s ≈ 0.06 → 显示 0.01）；荣耀等连续缓冲
+        # 全缓冲即单段，行为与旧版一致。静止判断（advancing/stale）语义不变。
         if n >= 2 and (self._last_max_ts is None or advancing):
-            span_s = (timestamps[-1] - timestamps[0]) / 1e9
-            if span_s > 0:
-                result["fps"] = round((n - 1) / span_s, 2)
+            main_seg = _main_segment(timestamps)
+            if len(main_seg) >= 2:
+                span_s = (main_seg[-1] - main_seg[0]) / 1e9
+                if span_s > 0:
+                    result["fps"] = round((len(main_seg) - 1) / span_s, 2)
+            else:
+                result["fps"] = 0.0   # 缓冲内仅孤立帧，无可测渲染节奏
         else:
             result["fps"] = 0.0
             if n >= 2 and cur_max is not None and self._last_max_ts is not None \
