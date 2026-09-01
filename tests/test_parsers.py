@@ -735,5 +735,41 @@ class TestJankRhythmThreshold(unittest.TestCase):
         self.assertGreater(thr / 1e6, 60)            # >60ms
 
 
+class TestOppoLayerResolve(unittest.TestCase):
+    """OPPO 机型层匹配（2026-08-27 适配）：跳过 ActivityRecordInputSink 输入层，
+    优先 SurfaceView；窗口层兜底不被输入层污染。"""
+
+    LIST_OPPO = (
+        "dumpsys SurfaceFlinger --list:\n"
+        "c2601e6 ActivityRecordInputSink com.tencent.mm/.ui.LauncherUI#147\n"
+        "ActivityRecord{e6a8841 u0 com.tencent.mm/.ui.LauncherUI t738}#143\n"
+        "6f89759 ActivityRecordInputSink com.tencent.mm/.plugin.appbrand.ui.AppBrandUI#628\n"
+        "ActivityRecord{ccb0fa0 u0 com.tencent.mm/.plugin.appbrand.ui.AppBrandUI t740}#617\n"
+        "e98d43b com.tencent.mm/com.tencent.mm.plugin.appbrand.ui.AppBrandUI#622\n"
+        "Background for SurfaceView[com.tencent.mm/com.tencent.mm.plugin.appbrand.ui.AppBrandUI]#777\n"
+        "SurfaceView[com.tencent.mm/com.tencent.mm.plugin.appbrand.ui.AppBrandUI](BLAST)#776\n"
+    )
+
+    def _resolve(self, out):
+        from metrics.fps import FpsCollector
+        adb = MockAdb({"dumpsys SurfaceFlinger --list": out})
+        c = FpsCollector(adb, "com.tencent.mm", "appbrand")
+        return c.resolve_layer()
+
+    def test_prefers_surfaceview_blast_over_input_sink(self):
+        layer = self._resolve(self.LIST_OPPO)
+        self.assertIn("SurfaceView[", layer)
+        self.assertIn("(BLAST)", layer)
+
+    def test_window_fallback_skips_input_sink(self):
+        # 无 SurfaceView 层（游戏启动初期）：窗口层兜底必须跳过 ActivityRecordInputSink
+        out = ("dumpsys SurfaceFlinger --list:\n"
+               "6f89759 ActivityRecordInputSink com.tencent.mm/.plugin.appbrand.ui.AppBrandUI#628\n"
+               "e98d43b com.tencent.mm/com.tencent.mm.plugin.appbrand.ui.AppBrandUI#622\n")
+        layer = self._resolve(out)
+        self.assertIn("AppBrandUI#622", layer)
+        self.assertNotIn("ActivityRecordInputSink", layer)
+
+
 if __name__ == "__main__":
     unittest.main()

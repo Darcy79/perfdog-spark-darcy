@@ -118,11 +118,14 @@ class FpsCollector:
                 else:
                     normal.append(raw)
                 continue
-            # 窗口层兜底：跳过容器/装饰层，只留应用窗口层
-            skip = ("ActivityRecord{", "Input ", "Dim layer", "Wallpaper",
-                    "Background for ", "Bounds for ", "Ime", "StatusBar",
-                    "NavigationBar", "Gesture", "Display Overlays", "RoundCorner")
-            if any(raw.startswith(p) for p in skip):
+            # 窗口层兜底：跳过容器/装饰层/输入层，只留应用窗口层
+            skip_prefix = ("ActivityRecord{", "Input ", "Dim layer", "Wallpaper",
+                           "Background for ", "Bounds for ", "Ime", "StatusBar",
+                           "NavigationBar", "Gesture", "Display Overlays", "RoundCorner")
+            # OPPO 特有输入事件层（hex id 前缀，如 "6f89759 ActivityRecordInputSink ..."），
+            # 无帧统计，绝不能作为窗口层兜底（2026-08-27 OPPO 适配）
+            skip_kw = ("ActivityRecordInputSink",)
+            if any(raw.startswith(p) for p in skip_prefix) or any(k in raw for k in skip_kw):
                 continue
             window.append(raw)
         # 优先 BLAST，其次普通 SurfaceView，最后窗口层（普通 View 应用）
@@ -337,8 +340,20 @@ class FpsCollector:
 
         # 关键：窗口层（非 SurfaceView）通常不提供 SF 帧统计 → 自动切 gfxinfo 通道
         # （微信小游戏是 SurfaceView 层，不走此分支，静止画面正常显示 0）
-        if n == 0 and not self.layer_is_surfaceview:
-            if self._gfx_read() is not None:
+        # OPPO 适配（2026-08-27）：窗口层 total_frames 可能为 1（无统计意义），
+        # 且游戏启动初期 SurfaceView 渲染层尚未创建时不能死等——先主动重匹配
+        # （5s 节流内不动作），SurfaceView 出现即换层；仍无帧再试 gfxinfo。
+        if n <= 1 and not self.layer_is_surfaceview:
+            self._try_resolve(ts)
+            if self.layer and self.layer_is_surfaceview:
+                try:
+                    out = self.adb.shell(["dumpsys", "SurfaceFlinger", "--latency", self.layer])
+                    refresh, timestamps = self._parse_latency(out)
+                    self.refresh_ns = refresh
+                    n = len(timestamps)
+                except Exception:
+                    n = 0
+            if n <= 1 and self._gfx_read() is not None:
                 self._switch_to_gfx(ts)
                 return self._sample_gfx(ts)
 
