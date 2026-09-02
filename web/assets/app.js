@@ -587,23 +587,41 @@
     return { rows: rows, cores: cores, device: device };
   }
 
-  // v46：把设备信息字典格式化成一行小字（报告 meta 区 / 状态栏）。
+  // v47：设备信息结构化 → 行数组 [{label, value}, ...]，历史看板 meta 区**分行分字段**显示。
+  //   - 设备行：市场名优先（无市场名用型号代码）；型号代码与市场名不同则附 " (型号代码)"
+  //   - 芯片行：cpu_hardware · cpu_max_freq_mhz(MHz) · N 核 —— 缺哪个跳哪个；
+  //     核数仅随芯片信息出现（避免无芯片信息时孤零零一行"8 核"）
+  //   - 分辨率行：screen_resolution
+  // 某行 value 为空则整行不返回；device 无有效字段返回 []。
+  // 值来自真机 getprop，渲染方必须转义（见 report.html：全部走 textContent 建节点）。
+  function deviceInfoLines(device, cores) {
+    if (!device || typeof device !== 'object') return [];
+    var lines = [];
+    // ① 设备行
+    var code = device.model_code || device.model;
+    var name = device.market_name || code;
+    if (name) {
+      var text = String(name);
+      if (code && String(code) !== text) text += ' (' + code + ')';
+      lines.push({ label: '设备', value: text });
+    }
+    // ② 芯片行（硬件型号 / 主频先组，核数仅在有芯片信息时追加）
+    var chip = [];
+    if (device.cpu_hardware) chip.push(device.cpu_hardware);
+    if (device.cpu_max_freq_mhz) chip.push(device.cpu_max_freq_mhz + 'MHz');
+    if (chip.length && cores) chip.push(cores + ' 核');
+    if (chip.length) lines.push({ label: '芯片', value: chip.join(' · ') });
+    // ③ 分辨率行
+    if (device.screen_resolution) lines.push({ label: '分辨率', value: device.screen_resolution });
+    return lines;
+  }
+
+  // 一行版（index.html 状态栏 / 老调用兼容）：基于 deviceInfoLines 重组，不重复逻辑。
   // 缺省字段静默跳过；全空返回空串。
   function formatDeviceInfo(device, cores) {
-    if (!device || typeof device !== 'object') return '';
-    var parts = [];
-    var name = device.market_name || device.model || device.model_code;
-    if (name) {
-      var nameText = name;
-      if (device.model && device.model !== name) nameText += ' (' + device.model + ')';
-      parts.push(nameText);
-    }
-    if (device.cpu_hardware) parts.push(device.cpu_hardware);
-    if (device.cpu_max_freq_mhz) parts.push(device.cpu_max_freq_mhz + 'MHz');
-    // 只有设备自身有内容（型号/CPU 等）才追加核数/分辨率，避免纯 cores 撑出空设备行
-    if (parts.length && cores) parts.push(cores + ' 核');
-    if (parts.length && device.screen_resolution) parts.push(device.screen_resolution);
-    return parts.join(' · ');
+    var lines = deviceInfoLines(device, cores);
+    if (!lines.length) return '';
+    return lines.map(function (l) { return l.value; }).join(' · ');
   }
 
   function statText(arr, unit, digits) {
@@ -1020,7 +1038,8 @@
     nearestCat: nearestCat,   // 纯函数，导出供 tests/test_nearest_cat.js 断言
     setCores: setCores,       // 注入核数（实时看板 /api/status；历史报告 meta 行）
     prepareRows: prepareRows, // 清洗 event 行 + 抽取核数/设备信息（历史报告/导出 HTML 用）
-    formatDeviceInfo: formatDeviceInfo, // 设备信息 → 一行小字（报告 meta 区/状态栏）
+    deviceInfoLines: deviceInfoLines,   // 设备信息 → 结构化行数组（历史看板分行渲染）
+    formatDeviceInfo: formatDeviceInfo, // 设备信息 → 一行小字（状态栏；基于 deviceInfoLines）
     setPinData: setPinData,
     renderAll: renderAll,
     updateStats: updateStats,

@@ -204,6 +204,10 @@ footer a { color: #4fc3f7; text-decoration: none; }
   background: #16212c; border: 1px solid #263545; border-radius: 6px;
   overflow-wrap: break-word;
 }
+/* v47：设备信息分行分字段显示（报告 meta 区），多行小字块，不与首行扎堆 */
+.dev-info { margin-top: 6px; font-size: 12px; line-height: 1.7; }
+.dev-info-label { color: #78909c; }
+.dev-info-value { color: #90a4ae; }
 
 @media (max-width: 900px) {
   .report-layout { flex-direction: column; }

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=46">
+<link rel="stylesheet" href="/assets/style.css?v=47">
 </head>
 <body>
 <header>
@@ -64,8 +64,8 @@
 
 <footer><span>自研 PerfDog · 报告数据来自本地 output/*.jsonl，不传云端</span></footer>
 
-<script src="/assets/echarts.min.js?v=46"></script>
-<script src="/assets/app.js?v=46"></script>
+<script src="/assets/echarts.min.js?v=47"></script>
+<script src="/assets/app.js?v=47"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -203,8 +203,6 @@
           if (r.target && r.target !== lastT) { targets.push({ pkg: r.target, t: r.t_ms }); lastT = r.target; }
         });
         var meta = name + ' · ' + dataRows.length + ' 个采样点';
-        var devText = window.PerfCharts.formatDeviceInfo(device, cores);
-        if (devText) meta += ' · 设备: ' + devText;
         if (targets.length) {
           var tdesc = '被测: ' + targets[0].pkg;
           for (var i = 1; i < targets.length; i++) {
@@ -212,7 +210,31 @@
           }
           meta += ' · ' + tdesc;
         }
-        document.getElementById('report-meta').textContent = meta;
+        // meta 首段（文本行）；textContent 赋值同时清空容器旧内容
+        var metaEl = document.getElementById('report-meta');
+        metaEl.textContent = meta;
+        // v47：设备信息分行分字段显示（原为扎堆一行）。全部用 createElement +
+        // textContent 构建——设备字段来自真机（型号/芯片名），textContent 天然
+        // 免疫 HTML 注入，无需转义；老数据无 device → deviceInfoLines 返回 []，不渲染。
+        var devLines = window.PerfCharts.deviceInfoLines(device, cores);
+        if (devLines.length) {
+          var box = document.createElement('div');
+          box.className = 'dev-info';
+          devLines.forEach(function (ln) {
+            var line = document.createElement('div');
+            line.className = 'dev-info-line';
+            var lab = document.createElement('span');
+            lab.className = 'dev-info-label';
+            lab.textContent = ln.label + '：';
+            var val = document.createElement('span');
+            val.className = 'dev-info-value';
+            val.textContent = ln.value;
+            line.appendChild(lab);
+            line.appendChild(val);
+            box.appendChild(line);
+          });
+          metaEl.appendChild(box);
+        }
         if (!charts.fps) {
           charts.fps = window.PerfCharts.makeChart('chart-fps', 'report');
           charts.frametime = window.PerfCharts.makeChart('chart-frametime', 'report');

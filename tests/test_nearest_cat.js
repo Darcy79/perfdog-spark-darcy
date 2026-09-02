@@ -133,6 +133,62 @@ if (typeof formatDeviceInfo !== 'function') {
   eq(formatDeviceInfo({ model: 'ADT-AN00' }, null), 'ADT-AN00', 'formatDeviceInfo：仅型号，无核数');
 }
 
+// ---------------- deviceInfoLines（v47：历史看板设备信息分行分字段） ----------------
+const deviceInfoLines = window.PerfCharts && window.PerfCharts.deviceInfoLines;
+if (typeof deviceInfoLines !== 'function') {
+  console.error('[x] app.js 未导出 window.PerfCharts.deviceInfoLines');
+  process.exit(1);
+}
+{
+  // 全字段：设备(市场名+型号) / 芯片(硬件·主频·核数) / 分辨率 三行，顺序固定
+  const dev = { model: 'ADT-AN00', market_name: 'Magic3 Pro', cpu_hardware: 'SM8350', cpu_max_freq_mhz: '1804.8', screen_resolution: '1080×2388' };
+  const lines = deviceInfoLines(dev, 8);
+  eq(lines.length, 3, 'deviceInfoLines：全字段 → 3 行');
+  eq(lines[0].label, '设备', 'deviceInfoLines：第 1 行标签=设备');
+  eq(lines[0].value, 'Magic3 Pro (ADT-AN00)', 'deviceInfoLines：市场名+型号组合');
+  eq(lines[1].label, '芯片', 'deviceInfoLines：第 2 行标签=芯片');
+  eq(lines[1].value, 'SM8350 · 1804.8MHz · 8 核', 'deviceInfoLines：芯片行硬件·主频·核数');
+  eq(lines[2].label, '分辨率', 'deviceInfoLines：第 3 行标签=分辨率');
+  eq(lines[2].value, '1080×2388', 'deviceInfoLines：分辨率值');
+}
+{
+  // 市场名与型号代码相同 → 不重复附 "(代码)"
+  const lines = deviceInfoLines({ model: 'ADT-AN00', market_name: 'ADT-AN00' }, null);
+  eq(lines.length, 1, 'deviceInfoLines：同名不附型号 → 仅设备行');
+  eq(lines[0].value, 'ADT-AN00', 'deviceInfoLines：市场名==型号时不重复');
+}
+{
+  // 无市场名 → 设备行只显示型号代码
+  const lines = deviceInfoLines({ model: 'PKC110' }, null);
+  eq(lines.length, 1, 'deviceInfoLines：无市场名仅 1 行');
+  eq(lines[0].value, 'PKC110', 'deviceInfoLines：无市场名 → 用型号');
+}
+{
+  // 缺哪个跳哪个：无分辨率 → 无第 3 行；无主频 → 芯片行不含 MHz
+  const lines = deviceInfoLines({ model: 'ADT-AN00', cpu_hardware: 'SM8350' }, 8);
+  eq(lines.length, 2, 'deviceInfoLines：缺分辨率 → 2 行');
+  eq(lines[1].value, 'SM8350 · 8 核', 'deviceInfoLines：芯片行缺主频跳主频');
+}
+{
+  // 核数仅随芯片信息出现：无芯片信息时不孤零零出 "8 核" 行
+  const lines = deviceInfoLines({ model: 'ADT-AN00', screen_resolution: '1080×2388' }, 8);
+  eq(lines.length, 2, 'deviceInfoLines：无芯片信息 → 设备+分辨率 2 行');
+  eq(lines[1].label, '分辨率', 'deviceInfoLines：无芯片行，第 2 行=分辨率');
+}
+{
+  // device 无效 → 空数组（老数据无 device 时 report.html 不渲染设备块）
+  eq(deviceInfoLines(null, 8).length, 0, 'deviceInfoLines：null → []');
+  eq(deviceInfoLines({}, 8).length, 0, 'deviceInfoLines：空对象 → []');
+  eq(deviceInfoLines(undefined, null).length, 0, 'deviceInfoLines：undefined → []');
+}
+{
+  // formatDeviceInfo 基于 deviceInfoLines 重组，一行版语义一致（index.html 状态栏不变）
+  const dev = { model: 'ADT-AN00', market_name: 'Magic3 Pro', cpu_hardware: 'SM8350', cpu_max_freq_mhz: '1804.8', screen_resolution: '1080×2388' };
+  eq(formatDeviceInfo(dev, 8),
+     'Magic3 Pro (ADT-AN00) · SM8350 · 1804.8MHz · 8 核 · 1080×2388',
+     'formatDeviceInfo：基于 lines 重组为一行');
+}
+
 if (failures.length) {
   console.error(`[x] 断言失败 ${failures.length} 条（通过 ${passed}）：`);
   failures.forEach((f) => console.error('    - ' + f));
