@@ -104,6 +104,35 @@ if (typeof prepareRows !== 'function' || typeof setCores !== 'function') {
   eq(pr3.cores, null, 'prepareRows：无 meta 时重置核数（不沿用旧报告）');
 }
 
+// ---------------- prepareRows 抽取设备信息 + formatDeviceInfo（v46 优化 2） ----------------
+const formatDeviceInfo = window.PerfCharts && window.PerfCharts.formatDeviceInfo;
+if (typeof formatDeviceInfo !== 'function') {
+  console.error('[x] app.js 未导出 window.PerfCharts.formatDeviceInfo');
+  process.exit(1);
+}
+{
+  const pr = prepareRows([
+    { ts: 1.0, event: 'meta', cores: 8, device: { model: 'ADT-AN00', market_name: 'Magic3 Pro', cpu_hardware: 'SM8350', cpu_max_freq_mhz: '1804.8', screen_resolution: '1080×2388' } },
+    { t_ms: 500, cpu: { cpu_proc_pct: 50 } },
+  ]);
+  eq(pr.device && pr.device.model, 'ADT-AN00', 'prepareRows：抽出设备信息 model');
+  eq(pr.device.market_name, 'Magic3 Pro', 'prepareRows：抽出设备信息市场名');
+}
+{
+  const dev = { model: 'ADT-AN00', market_name: 'Magic3 Pro', cpu_hardware: 'SM8350', cpu_max_freq_mhz: '1804.8', screen_resolution: '1080×2388' };
+  const text = formatDeviceInfo(dev, 8);
+  eq(text.indexOf('Magic3 Pro') >= 0, true, 'formatDeviceInfo：含市场名');
+  eq(text.indexOf('ADT-AN00') >= 0, true, 'formatDeviceInfo：含型号代码');
+  eq(text.indexOf('SM8350') >= 0, true, 'formatDeviceInfo：含 CPU 型号');
+  eq(text.indexOf('1080×2388') >= 0, true, 'formatDeviceInfo：含分辨率');
+  eq(text.indexOf('8 核') >= 0, true, 'formatDeviceInfo：含核数');
+}
+{
+  eq(formatDeviceInfo(null, 8), '', 'formatDeviceInfo：null → 空串');
+  eq(formatDeviceInfo({}, 8), '', 'formatDeviceInfo：空对象 → 空串');
+  eq(formatDeviceInfo({ model: 'ADT-AN00' }, null), 'ADT-AN00', 'formatDeviceInfo：仅型号，无核数');
+}
+
 if (failures.length) {
   console.error(`[x] 断言失败 ${failures.length} 条（通过 ${passed}）：`);
   failures.forEach((f) => console.error('    - ' + f));

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 实时看板</title>
-<link rel="stylesheet" href="/assets/style.css?v=43">
+<link rel="stylesheet" href="/assets/style.css?v=46">
 </head>
 <body>
 <header>
@@ -58,8 +58,8 @@
   <span>自研 PerfDog · 数据仅存本地（output/*.jsonl）· <a href="/report.html">历史报告 →</a></span>
 </footer>
 
-<script src="/assets/echarts.min.js?v=43"></script>
-<script src="/assets/app.js?v=43"></script>
+<script src="/assets/echarts.min.js?v=46"></script>
+<script src="/assets/app.js?v=46"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -124,7 +124,13 @@
 
   function refreshStatus() {
     fetch('/api/status').then(function (r) { return r.json(); }).then(function (s) {
-      document.getElementById('st-device').textContent = '设备: ' + (s.device || '-');
+      // v46：设备显示市场名+型号（有则），否则回退序列号
+      var devName = s.device || '-';
+      if (s.device_info && typeof s.device_info === 'object') {
+        var mn = s.device_info.market_name || s.device_info.model || s.device_info.model_code;
+        if (mn) devName = mn + (s.device_info.model && s.device_info.model !== mn ? ' (' + s.device_info.model + ')' : '');
+      }
+      document.getElementById('st-device').textContent = '设备: ' + devName;
       document.getElementById('st-pid').textContent = '进程: ' + (s.pid || '-');
       document.getElementById('st-run').textContent = '本次: ' + (s.run_id || '-');
       // 数据目录常驻显示（打包后改动 P0：用户随时知道数据存哪）

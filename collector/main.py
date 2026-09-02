@@ -29,6 +29,7 @@ from metrics.network import NetworkCollector
 from metrics.thermal import ThermalCollector
 from logcat import LogcatMonitor
 from data_health import check_rows_live
+from device_info import probe_device_info
 
 # 各指标独立采样间隔（秒）。FPS 高频（0.5s）让 Jank 及时出现；
 # 内存/温度低频（2s）避免 dumpsys 拖慢整体。并行后互不阻塞。
@@ -114,6 +115,13 @@ def main():
     cores = CpuCollector.probe_cores(adb)
     print(f"[+] CPU 核数: {cores}")
 
+    # 探测设备信息（2026-08-27）：型号/市场名/平台/CPU/分辨率，一次 shell 往返。
+    # 失败项静默 None，不影响采集；写入 status + meta 行供报告展示。
+    device_info = probe_device_info(adb)
+    if device_info.get("model"):
+        print(f"[+] 设备: {device_info.get('market_name') or device_info.get('model')}"
+              f"（{device_info.get('model')}）")
+
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     # 每次采集新建一个按时间命名的文件夹，内含 jsonl 与 html 报告，避免历史数据混淆
     run_dir = os.path.join(outdir, run_id)
@@ -172,7 +180,7 @@ def main():
                              name="open-browser").start()
         web.set_status(running=True, device=adb.serial, pid=pid, run_id=run_id,
                        target=package, process_pattern=process_pattern,
-                       cores=cores,
+                       cores=cores, device_info=device_info,
                        started_at=datetime.now().strftime("%H:%M:%S"))
 
         # ---- 看板下拉"切换被测应用"回调（方案 A 2026-08-20） ----
@@ -299,6 +307,7 @@ def main():
             "event": "meta",
             "cores": cores,
             "proc_name": getattr(resolver, "proc_name", None) or package,
+            "device": device_info,
         }, ensure_ascii=False) + "\n")
         while not stop["flag"]:
             ts = time.time()

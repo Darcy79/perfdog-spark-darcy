@@ -242,13 +242,43 @@
 
   // 锁定时刻各模块数据浮层（仿 tooltip 样式，DOM 实现，独立于 ECharts tooltip 不与白线冲突）
   var _pinRows = [];
+  // v46：按数值降序排数据项——哪个数值更高就显示在上面（用户原话"白线停在哪，哪个数值高就显示在最上面"）。
+  // 各图单位不同（FPS/Jank%/CPU%/MB/KB/s/°C/V），统一按"显示数值大小"比较即可，无需单位换算。
+  function _pinSortParts(items, suffix) {
+    var valid = items.filter(function (it) {
+      return it && typeof it[0] === 'number' && isFinite(it[0]);
+    });
+    valid.sort(function (a, b) { return b[0] - a[0]; });
+    var text = valid.map(function (it) { return it[1]; }).join(' · ');
+    return text ? (text + (suffix || '')) : '';
+  }
   var _PIN_FIELDS = {
-    'chart-fps':       function (r) { var f = r.fps || {}; var s = []; if (f.fps != null) s.push('FPS ' + f.fps); if (f.jank_rate != null) s.push('Jank ' + (f.jank_rate * 100).toFixed(1) + '%'); return s.join(' · '); },
-    'chart-frametime': function (r) { var f = r.fps || {}; var s = []; if (f.frame_p50_ms != null) s.push('P50 ' + f.frame_p50_ms + 'ms'); if (f.frame_max_ms != null) s.push('Max ' + f.frame_max_ms + 'ms'); return s.join(' · '); },
-    'chart-cpu':       function (r) { var c = r.cpu || {}; var s = []; if (c.cpu_total_pct != null) s.push('总 ' + c.cpu_total_pct + '%'); if (c.cpu_proc_pct != null) s.push('进程 ' + c.cpu_proc_pct + '%'); if (_cores && c.cpu_proc_pct != null) s.push('占整机 ' + (c.cpu_proc_pct / _cores).toFixed(1) + '%'); return s.join(' · '); },
-    'chart-mem':       function (r) { var m = r.mem || {}; var s = []; if (m.pss_kb != null) s.push('PSS ' + (m.pss_kb / 1024).toFixed(1) + 'MB'); if (m.vmrss_kb != null) s.push('RSS ' + (m.vmrss_kb / 1024).toFixed(1) + 'MB'); return s.join(' · '); },
-    'chart-net':       function (r) { var n = r.net || {}; var s = []; if (n.rx_kbps != null) s.push('↓' + n.rx_kbps); if (n.tx_kbps != null) s.push('↑' + n.tx_kbps); return s.join(' · ') + ' KB/s'; },
-    'chart-temp':      function (r) { var t = r.therm || {}; var s = []; if (t.temp_c != null) s.push(t.temp_c + '°C'); if (t.voltage_v != null) s.push(t.voltage_v + 'V'); return s.join(' · '); },
+    'chart-fps':       function (r) { var f = r.fps || {}; return _pinSortParts([
+      [f.fps, 'FPS ' + f.fps],
+      [f.jank_rate != null ? f.jank_rate * 100 : null, f.jank_rate != null ? 'Jank ' + (f.jank_rate * 100).toFixed(1) + '%' : null],
+    ]); },
+    'chart-frametime': function (r) { var f = r.fps || {}; return _pinSortParts([
+      [f.frame_p50_ms, 'P50 ' + f.frame_p50_ms + 'ms'],
+      [f.frame_p95_ms, 'P95 ' + f.frame_p95_ms + 'ms'],
+      [f.frame_max_ms, 'Max ' + f.frame_max_ms + 'ms'],
+    ]); },
+    'chart-cpu':       function (r) { var c = r.cpu || {}; var ofTotal = (_cores && c.cpu_proc_pct != null) ? c.cpu_proc_pct / _cores : null; return _pinSortParts([
+      [c.cpu_total_pct, '总 ' + c.cpu_total_pct + '%'],
+      [c.cpu_proc_pct, '进程 ' + c.cpu_proc_pct + '%'],
+      [ofTotal, ofTotal != null ? '占整机 ' + ofTotal.toFixed(1) + '%' : null],
+    ]); },
+    'chart-mem':       function (r) { var m = r.mem || {}; return _pinSortParts([
+      [m.pss_kb != null ? m.pss_kb / 1024 : null, m.pss_kb != null ? 'PSS ' + (m.pss_kb / 1024).toFixed(1) + 'MB' : null],
+      [m.vmrss_kb != null ? m.vmrss_kb / 1024 : null, m.vmrss_kb != null ? 'RSS ' + (m.vmrss_kb / 1024).toFixed(1) + 'MB' : null],
+    ]); },
+    'chart-net':       function (r) { var n = r.net || {}; return _pinSortParts([
+      [n.rx_kbps, '↓' + n.rx_kbps],
+      [n.tx_kbps, '↑' + n.tx_kbps],
+    ], ' KB/s'); },
+    'chart-temp':      function (r) { var t = r.therm || {}; return _pinSortParts([
+      [t.temp_c, t.temp_c + '°C'],
+      [t.voltage_v, t.voltage_v + 'V'],
+    ]); },
   };
   function setPinData(rows) { _pinRows = rows || []; }
   function _pinShowData(idx, localX) {
@@ -538,20 +568,42 @@
   // 否则会在 x 轴塞进 NaN 类目、污染帧/CPU 等系列；核数从 {"event":"meta","cores":N} 提取。
   // 返回 { rows: [...], cores: <number|null> }；cores 已同步 setCores。
   function prepareRows(raw) {
-    var rows = [], cores = null;
+    var rows = [], cores = null, device = null;
     (raw || []).forEach(function (r) {
       if (!r || typeof r !== 'object') return;
       if (r.event) {
-        if (r.event === 'meta' && r.cores) {
-          var c = parseInt(r.cores, 10);
-          if (isFinite(c) && c > 0) cores = c;
+        if (r.event === 'meta') {
+          if (r.cores) {
+            var c = parseInt(r.cores, 10);
+            if (isFinite(c) && c > 0) cores = c;
+          }
+          if (r.device && typeof r.device === 'object') device = r.device;
         }
         return;   // event 行（meta / target_switch）不当作采样点
       }
       rows.push(r);
     });
     setCores(cores);   // 无论是否读到都重置：避免切到无 meta 行的报告时沿用上一份的核数
-    return { rows: rows, cores: cores };
+    return { rows: rows, cores: cores, device: device };
+  }
+
+  // v46：把设备信息字典格式化成一行小字（报告 meta 区 / 状态栏）。
+  // 缺省字段静默跳过；全空返回空串。
+  function formatDeviceInfo(device, cores) {
+    if (!device || typeof device !== 'object') return '';
+    var parts = [];
+    var name = device.market_name || device.model || device.model_code;
+    if (name) {
+      var nameText = name;
+      if (device.model && device.model !== name) nameText += ' (' + device.model + ')';
+      parts.push(nameText);
+    }
+    if (device.cpu_hardware) parts.push(device.cpu_hardware);
+    if (device.cpu_max_freq_mhz) parts.push(device.cpu_max_freq_mhz + 'MHz');
+    // 只有设备自身有内容（型号/CPU 等）才追加核数/分辨率，避免纯 cores 撑出空设备行
+    if (parts.length && cores) parts.push(cores + ' 核');
+    if (parts.length && device.screen_resolution) parts.push(device.screen_resolution);
+    return parts.join(' · ');
   }
 
   function statText(arr, unit, digits) {
@@ -606,6 +658,8 @@
       // bottom 在有时间滑动条时让出空间给 slider
       grid: { left: 56, right: 24, top: 34, bottom: 28 },
       tooltip: { trigger: 'axis', confine: true,
+        // v46：白线 tooltip 按数值降序排列（FPS 59 在 Jank 3 上面、进程% 129 在整机% 43 上面）
+        order: 'valueDesc',
         valueFormatter: function (v) { return (typeof v === 'number') ? v.toFixed(2) : v; } },
       xAxis: { type: 'category', name: '秒', nameTextStyle: { fontSize: 10 }, axisLabel: { fontSize: 10 } },
       yAxis: { type: 'value', scale: true, axisLabel: { fontSize: 10 } },
@@ -965,7 +1019,8 @@
     renderEvents: renderEvents,
     nearestCat: nearestCat,   // 纯函数，导出供 tests/test_nearest_cat.js 断言
     setCores: setCores,       // 注入核数（实时看板 /api/status；历史报告 meta 行）
-    prepareRows: prepareRows, // 清洗 event 行 + 抽取核数（历史报告/导出 HTML 用）
+    prepareRows: prepareRows, // 清洗 event 行 + 抽取核数/设备信息（历史报告/导出 HTML 用）
+    formatDeviceInfo: formatDeviceInfo, // 设备信息 → 一行小字（报告 meta 区/状态栏）
     setPinData: setPinData,
     renderAll: renderAll,
     updateStats: updateStats,
