@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=47">
+<link rel="stylesheet" href="/assets/style.css?v=48">
 </head>
 <body>
 <header>
@@ -17,6 +17,8 @@
 <main class="report-layout">
   <aside id="run-list" class="run-list">
     <h3>采集记录</h3>
+    <!-- v48（UI优化 2.4）：轮询发现新记录时的提示胶囊（点击滚回顶部） -->
+    <div class="new-runs-pill" id="new-runs-pill"></div>
     <div class="filter-bar">
       <input id="filter-keyword" class="filter-input" type="text" placeholder="搜索备注 / 文件名…">
       <div class="filter-dates">
@@ -32,7 +34,22 @@
     <div id="report-placeholder" class="placeholder">← 左侧选择一条采集记录查看报告</div>
     <div id="report-body" style="display:none">
       <div class="report-meta" id="report-meta"></div>
-      <div class="drag-hint">↕ 拖动卡片调整顺序 · 悬停看贯穿线 · 点击锁定贯穿线（再点/双击解锁）· 底部时间条：拖两端<span class="hint-highlight">↔缩放</span> · 拖中间<span class="hint-highlight">=平移</span> · 点空白<span class="hint-highlight">=跳转</span></div>
+      <!-- v48（UI优化 1.4/3.5）：提示行收敛为短提示 + "?" 操作卡（含 legend 选数据、虚线=日志事件说明） -->
+      <div class="drag-hint" style="position:relative">
+        <span>悬停贯穿 · 点击锁定 · "?" 看全部操作</span>
+        <span class="hint-btn" id="hint-btn" title="操作说明">?</span>
+        <div class="hint-card" id="hint-card">
+          <b>悬停图表</b>：白色贯穿线跨图同步（tooltip 联动）<br>
+          <b>点击图表</b>：锁定蓝色贯穿线（再点同点 / 双击解锁）<br>
+          <b>图例(右上角)</b>：点击可切换该条曲线显示/隐藏，自选要看的指标<br>
+          <b>虚线标注</b>：蓝色=日志事件（场景/进入/退出）、红色=报错事件（logcat 采集）<br>
+          <b>↕ 拖动卡片</b>：调整图表顺序（自动记住）<br>
+          <b>顶部时间条</b>：拖两端 ↔缩放 · 拖中间 =平移 · 点空白 =窗口跳转（全图联动）<br>
+          <b>📄</b>：列表项图标可在新窗口打开可分享的自包含报告
+        </div>
+      </div>
+      <!-- v48（UI优化 3.1）：全局单时间条（控制所有图表缩放），原 6 图各挂一条已去除 -->
+      <div class="global-slider-wrap" id="global-slider-wrap" style="display:none"></div>
       <div class="summary" id="report-summary"></div>
       <section class="chart-card">
         <div class="chart-head"><h2>FPS / Jank</h2><div id="stat-fps" class="stat-line"></div></div>
@@ -63,9 +80,11 @@
 </main>
 
 <footer><span>自研 PerfDog · 报告数据来自本地 output/*.jsonl，不传云端</span></footer>
+<!-- v48（UI优化 3.4）：深色 toast 浮层（替代失败类 alert） -->
+<div class="pd-toast" id="pd-toast"></div>
 
-<script src="/assets/echarts.min.js?v=47"></script>
-<script src="/assets/app.js?v=47"></script>
+<script src="/assets/echarts.min.js?v=48"></script>
+<script src="/assets/app.js?v=48"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -83,6 +102,18 @@
     el.style.display = show ? 'flex' : 'none';
   }
 
+  // v48（UI优化 3.4）：深色 toast（右下 2.5s 自消）——失败类提示不再用 alert 打断操作流
+  function toast(msg, type) {
+    var box = document.getElementById('pd-toast');
+    if (!box) return;
+    var item = document.createElement('div');
+    item.className = 'pd-toast-item' + (type === 'err' ? ' err' : type === 'ok' ? ' ok' : '');
+    item.textContent = msg;   // textContent 免疫注入（消息可能含服务端错误详情）
+    box.appendChild(item);
+    setTimeout(function () { if (item.parentNode) item.parentNode.removeChild(item); }, 2500);
+    while (box.children.length > 3) box.removeChild(box.firstChild);   // 最多同屏 3 条
+  }
+
   function loadRuns() {
     fetch('/api/runs').then(function (r) { return r.json(); }).then(function (runs) {
       var next = runs || [];
@@ -92,7 +123,18 @@
         return x.name + '|' + x.points + '|' + x.size_kb + '|' + x.mtime + '|' + (x.remark || '');
       }).join('\n');
       if (sig === lastRunsSig) return;
+      var isFirst = lastRunsSig === null;
       lastRunsSig = sig;
+      // v48（UI优化 2.4）：非首载且记录数增多 → 顶部胶囊提示"有 N 条新记录"
+      if (!isFirst && next.length > allRuns.length) {
+        var pill = document.getElementById('new-runs-pill');
+        if (pill) {
+          pill.textContent = '有 ' + (next.length - allRuns.length) + ' 条新记录 ↑';
+          pill.style.display = 'block';
+          clearTimeout(loadRuns._pillTimer);
+          loadRuns._pillTimer = setTimeout(function () { pill.style.display = 'none'; }, 8000);
+        }
+      }
       allRuns = next;
       renderRuns();
     }).catch(function () {});
@@ -130,20 +172,43 @@
       return;
     }
     filtered.forEach(function (run) {
+      // v48（UI优化 1.5）：备注去重——有备注时标题只显示备注（文件名已在 ✎ 悬停可见），
+      // 去掉原来"备注 (文件名)" + 单独"📝 备注"的两处重复，列表项从 3 行减到 2 行。
+      // 全部 createElement + textContent 构建（备注来自用户输入，免疫注入）。
       var el = document.createElement('div');
       el.className = 'run-item' + (selected === run.name ? ' active' : '');
-      var title = run.remark ? run.remark + '　(' + run.name + ')' : run.name;
-      el.innerHTML =
-        '<div class="run-name">' + title +
-          '<span class="rename-btn" title="重命名/添加备注">✎</span></div>' +
-        (run.remark ? '<div class="run-remark">📝 ' + run.remark + '</div>' : '') +
-        '<div class="run-meta">' + run.mtime + ' · ' + run.points + ' 点 · ' + run.size_kb + ' KB</div>';
-      el.onclick = function () { selectRun(run.name); };
-      // 改名按钮：阻止触发列表选择，弹框输入新名称
-      el.querySelector('.rename-btn').onclick = function (e) {
+      var nameRow = document.createElement('div');
+      nameRow.className = 'run-name';
+      var title = document.createElement('span');
+      title.textContent = run.remark || run.name;
+      title.title = run.name;   // 悬停看文件名
+      nameRow.appendChild(title);
+      // v48（UI优化 4.1）：打开自包含报告（新窗口 /api/raw，可分享/存档）
+      var htmlName = run.name.replace(/\.jsonl$/, '.html');
+      var openBtn = document.createElement('span');
+      openBtn.className = 'open-report-btn';
+      openBtn.title = '新窗口打开自包含报告（可分享）';
+      openBtn.textContent = '📄';
+      openBtn.onclick = function (e) {
+        e.stopPropagation();
+        window.open('/api/raw?name=' + encodeURIComponent(htmlName), '_blank');
+      };
+      nameRow.appendChild(openBtn);
+      var renameBtn = document.createElement('span');
+      renameBtn.className = 'rename-btn';
+      renameBtn.title = '重命名/添加备注';
+      renameBtn.textContent = '✎';
+      renameBtn.onclick = function (e) {
         e.stopPropagation();
         renameRun(run.name, run.remark);
       };
+      nameRow.appendChild(renameBtn);
+      el.appendChild(nameRow);
+      var metaRow = document.createElement('div');
+      metaRow.className = 'run-meta';
+      metaRow.textContent = run.mtime + ' · ' + run.points + ' 点 · ' + run.size_kb + ' KB';
+      el.appendChild(metaRow);
+      el.onclick = function () { selectRun(run.name); };
       box.appendChild(el);
     });
   }
@@ -158,9 +223,9 @@
       .then(function (r) { return r.json(); })
       .then(function (res) {
         if (res && res.ok) loadRuns();
-        else alert('重命名失败: ' + (res && res.error || '未知错误'));
+        else toast('重命名失败: ' + (res && res.error || '未知错误'), 'err');   // v48（3.4）
       })
-      .catch(function () { alert('重命名失败'); });
+      .catch(function () { toast('重命名失败', 'err'); });   // v48（3.4）
   }
 
   function selectRun(name) {
@@ -180,12 +245,12 @@
         // 业务层错误：服务端返回 {"error": ...}（bad name/路径/文件缺失等），单独提示
         if (rows && !Array.isArray(rows) && rows.error) {
           setPlaceholder(PH_DEFAULT, true);
-          alert('读取失败: ' + rows.error);
+          toast('读取失败: ' + rows.error, 'err');   // v48（3.4）
           return;
         }
         if (!Array.isArray(rows) || !rows.length) {
           setPlaceholder(PH_DEFAULT, true);
-          alert('读取失败或文件为空');
+          toast('读取失败或文件为空', 'err');   // v48（3.4）
           return;
         }
         document.getElementById('report-body').style.display = 'block';
@@ -202,17 +267,38 @@
         dataRows.forEach(function (r) {
           if (r.target && r.target !== lastT) { targets.push({ pkg: r.target, t: r.t_ms }); lastT = r.target; }
         });
-        var meta = name + ' · ' + dataRows.length + ' 个采样点';
+        var tdesc = '';
         if (targets.length) {
-          var tdesc = '被测: ' + targets[0].pkg;
+          tdesc = targets[0].pkg;
           for (var i = 1; i < targets.length; i++) {
             tdesc += ' → ' + targets[i].pkg + '(@' + Math.round(targets[i].t / 1000) + 's)';
           }
-          meta += ' · ' + tdesc;
         }
-        // meta 首段（文本行）；textContent 赋值同时清空容器旧内容
+        // v48（UI优化 1.2）：meta 重排——备注(无则文件名)+被测应用前置为大字，
+        // 文件名/点数/核数降为灰字小行。全部 createElement+textContent 构建（免疫注入）。
         var metaEl = document.getElementById('report-meta');
-        metaEl.textContent = meta;
+        metaEl.textContent = '';   // 清空旧内容（含上次设备行）
+        var remark = '';
+        var matched = allRuns.filter(function (r) { return r.name === name; })[0];
+        if (matched && matched.remark) remark = matched.remark;
+        var shortName = name.replace(/^.*\//, '');   // 去掉日期目录前缀
+        var primary = document.createElement('div');
+        primary.className = 'meta-primary';
+        var lead = document.createElement('b');
+        lead.textContent = remark || shortName;
+        primary.appendChild(lead);
+        if (tdesc) {
+          var tgt = document.createElement('span');
+          tgt.textContent = ' · 被测 ' + tdesc;
+          primary.appendChild(tgt);
+        }
+        var secondary = document.createElement('div');
+        secondary.className = 'meta-secondary';
+        var secTxt = name + ' · ' + dataRows.length + ' 个采样点';
+        if (cores) secTxt += ' · ' + cores + ' 核';
+        secondary.textContent = secTxt;
+        metaEl.appendChild(primary);
+        metaEl.appendChild(secondary);
         // v47：设备信息分行分字段显示（原为扎堆一行）。全部用 createElement +
         // textContent 构建——设备字段来自真机（型号/芯片名），textContent 天然
         // 免疫 HTML 注入，无需转义；老数据无 device → deviceInfoLines 返回 []，不渲染。
@@ -250,8 +336,11 @@
         window.PerfCharts.renderSummary('report-summary', window.PerfCharts.computeStats(dataRows));
         window.PerfCharts.clearPin();   // 切换报告时清除上一份的锁定贯穿线
         window.PerfCharts.setPinData(dataRows); // 供点击锁定显示各模块时刻数据
+        // v48（UI优化 3.1）：全局单时间条（挂在汇总卡上方，控制全部图表缩放）
+        var gsWrap = document.getElementById('global-slider-wrap');
         window.PerfCharts.clearTimeSliders();           // 重建前清旧拖动条
-        window.PerfCharts.createTimeSliders(charts, dataRows); // 自写 PerfDog 风格拖动条
+        gsWrap.style.display = 'block';
+        window.PerfCharts.createTimeSliders(charts, dataRows, gsWrap);
         // 模式1：加载 logcat 事件标注层（场景/console 事件叠加到曲线）
         fetch('/api/events?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); })
           .then(function (events) {
@@ -259,6 +348,12 @@
               window.PerfCharts.renderEvents(charts, dataRows, events);
             }
           }).catch(function () {});
+        // v48（UI优化 4.2）：URL hash 定位——刷新/分享链接后自动回到本报告
+        try { history.replaceState(null, '', '#name=' + encodeURIComponent(name)); } catch (err) {}
+        // v48（UI优化 3.3）：窄屏（≤900px 列表在上）选记录后把报告区滚入视口
+        if (window.matchMedia && window.matchMedia('(max-width: 900px)').matches) {
+          try { document.getElementById('report-body').scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (err) {}
+        }
       }).catch(function (e) {
         if (seq !== loadingSeq) return;
         setPlaceholder(PH_DEFAULT, true);
@@ -266,9 +361,9 @@
         // 笼统显示 "Failed to fetch" 会让用户误以为数据损坏 → 明确引导重启看板
         var isNet = e && (e.name === 'TypeError' ||
                     /Failed to fetch|NetworkError|Load failed/i.test(String(e)));
-        alert(isNet
+        toast(isNet
           ? '无法连接看板服务（服务可能已关闭或端口变更），请重新启动看板后刷新本页。'
-          : '读取失败: ' + e);
+          : '读取失败: ' + e, 'err');   // v48（UI优化 3.4）：toast 替代 alert
       });
   }
 
@@ -281,9 +376,43 @@
   document.getElementById('filter-start').addEventListener('change', renderRuns);
   document.getElementById('filter-end').addEventListener('change', renderRuns);
 
+  // v48（UI优化 1.4）："?" 操作卡——点击切换展开/收起；点击外部自动收起
+  (function () {
+    var btn = document.getElementById('hint-btn');
+    var card = document.getElementById('hint-card');
+    if (!btn || !card) return;
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      card.classList.toggle('show');
+    });
+    document.addEventListener('click', function (e) {
+      if (!card.contains(e.target)) card.classList.remove('show');
+    });
+  })();
+
+  // v48（UI优化 2.4）：新记录胶囊点击 → 滚回列表顶部并隐藏
+  (function () {
+    var pill = document.getElementById('new-runs-pill');
+    if (!pill) return;
+    pill.addEventListener('click', function () {
+      var list = document.getElementById('runs');
+      if (list) list.parentElement.scrollTop = 0;
+      pill.style.display = 'none';
+    });
+  })();
+
   window.PerfCharts.initSortable('#report-body');
   loadRuns();
   setInterval(loadRuns, 5000);
+
+  // v48（UI优化 4.2）：页面加载时读 URL hash（#name=xxx）自动打开对应报告，支持分享链接
+  (function () {
+    var m = location.hash.match(/^#name=(.+)$/);
+    if (m) {
+      var name = decodeURIComponent(m[1]);
+      if (name) setTimeout(function () { selectRun(name); }, 0);
+    }
+  })();
 })();
 </script>
 </body>

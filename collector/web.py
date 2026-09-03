@@ -399,6 +399,12 @@ class WebServer:
                     qs = parse_qs(parsed.query)
                     name = (qs.get("name") or [""])[0]
                     self._send_json_api(lambda: self._load_events(name))
+                elif path == "/api/raw":
+                    # UI优化 4.1：伺服 output 下采集结束时自动生成的自包含 HTML 报告
+                    # （只读，防穿越校验与 _load_report 同口径），供列表"📄 打开报告"新窗口分享
+                    qs = parse_qs(parsed.query)
+                    name = (qs.get("name") or [""])[0]
+                    self._send_raw(name)
                 else:
                     self._send(404, json.dumps({"error": "not found"}))
 
@@ -721,6 +727,25 @@ class WebServer:
                 except Exception:
                     return []
                 return events
+
+            def _send_raw(self, name):
+                """UI优化 4.1：伺服 output 下的自包含 HTML 报告（只读）。
+
+                采集结束自动生成 output/<run_dir>/perfdog_<run_id>.html，用户要在
+                看板内一键打开/分享。防穿越校验与 _load_report 同口径：
+                规范化后必须仍在 output 目录内；只放行 .html。
+                """
+                if not name or not name.endswith(".html") or len(name) > 1024:
+                    self._send(400, json.dumps({"error": "bad name"}, ensure_ascii=False))
+                    return
+                base = os.path.realpath(server.output_dir)
+                fp = os.path.realpath(os.path.join(base, name))
+                if not fp.startswith(base + os.sep):
+                    self._send(400, json.dumps({"error": "bad path"}, ensure_ascii=False))
+                    return
+                # 直接复用 _send_file：二进制读 + Content-Length + no-store；
+                # 文件不存在时自动 404（与 /assets 静态文件一致）
+                self._send_file(fp, "text/html; charset=utf-8")
 
             def _load_report(self, name):
                 # 允许子目录路径，但做防穿越校验：规范化后必须仍在 output 目录内

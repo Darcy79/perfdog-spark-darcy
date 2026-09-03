@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 实时看板</title>
-<link rel="stylesheet" href="/assets/style.css?v=47">
+<link rel="stylesheet" href="/assets/style.css?v=48">
 </head>
 <body>
 <header>
@@ -58,8 +58,8 @@
   <span>自研 PerfDog · 数据仅存本地（output/*.jsonl）· <a href="/report.html">历史报告 →</a></span>
 </footer>
 
-<script src="/assets/echarts.min.js?v=47"></script>
-<script src="/assets/app.js?v=47"></script>
+<script src="/assets/echarts.min.js?v=48"></script>
+<script src="/assets/app.js?v=48"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -69,6 +69,7 @@
   var currentTarget = null;   // 当前被测目标 {package, process_pattern}
   var appList = [];           // 已安装应用缓存
   var cores = null;           // 设备核数（/api/status），供 CPU 图"进程占整机%"曲线
+  var lastRunId = null;       // v48（UI优化 4.4）：本次采集 run_id，停止后拼"查看本次报告"链接
 
   function init() {
     charts.fps = window.PerfCharts.makeChart('chart-fps');
@@ -133,6 +134,7 @@
       document.getElementById('st-device').textContent = '设备: ' + devName;
       document.getElementById('st-pid').textContent = '进程: ' + (s.pid || '-');
       document.getElementById('st-run').textContent = '本次: ' + (s.run_id || '-');
+      if (s.run_id) lastRunId = s.run_id;   // v48（UI优化 4.4）：记住本次 run，供停止后直达链接
       // 数据目录常驻显示（打包后改动 P0：用户随时知道数据存哪）
       document.getElementById('st-outdir').textContent = '数据: ' + (s.outdir || '-');
       var pill = document.getElementById('st-state');
@@ -176,6 +178,15 @@
       fetch('/api/stop', { method: 'POST' }).then(function (r) { return r.json(); }).then(function (d) {
         st.textContent = d && d.ok ? '✔ 已停止' : '✘ ' + ((d && d.error) || '停止失败');
         st.className = d && d.ok ? 'tb-msg ok' : 'tb-msg err';
+        // v48（UI优化 4.4）：停止成功后追加"查看本次报告 →"直达链接——
+        // 跳到历史看板并用 #name= 自动打开本次记录（配合 report.html 的 hash 定位）
+        if (d && d.ok && lastRunId) {
+          var a = document.createElement('a');
+          a.href = '/report.html#name=' +
+                   encodeURIComponent(lastRunId + '/perfdog_' + lastRunId + '.jsonl');
+          a.textContent = ' 查看本次报告 →';
+          st.appendChild(a);   // createElement 构建，run_id 不拼 innerHTML
+        }
       }).catch(function () { st.textContent = '✘ 请求失败'; st.className = 'tb-msg err'; });
     };
     loadApps();       // 加载已装应用列表（构建下拉选项）

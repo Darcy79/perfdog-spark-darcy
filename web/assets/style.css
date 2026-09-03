@@ -89,8 +89,10 @@ main { flex: 1; padding: 16px 20px; display: flex; flex-direction: column; gap: 
   min-height: 22px;
 }
 .chart-head h2 { font-size: 14px; color: #b0bec5; font-weight: 600; flex: 0 0 auto; white-space: nowrap; }
+/* v48（UI优化 2.2）：统计栏颜色去黄——统一黄 #ffd54f 与"进程 CPU"曲线同色、
+   且黄有警告误暗示；改中性浅灰，语义中性不误导 */
 .stat-line {
-  font-size: 12px; color: #ffd54f; flex: 1 1 auto; min-width: 0;
+  font-size: 12px; color: #b0bec5; flex: 1 1 auto; min-width: 0;
   text-align: right; line-height: 1.6;
   overflow-wrap: break-word;
 }
@@ -102,14 +104,44 @@ main { flex: 1; padding: 16px 20px; display: flex; flex-direction: column; gap: 
 .chart-card.sortable { cursor: grab; }
 .chart-card.dragging { opacity: .45; border-style: dashed; }
 .chart-card.drop-target { border-color: #4fc3f7; box-shadow: 0 0 0 1px #4fc3f7 inset; }
-.drag-hint { font-size: 11px; color: #546e7a; margin-bottom: 4px; text-align: right; }
-.hint-highlight { color: #4fc3f7; font-weight: bold; }
+
+/* v48（UI优化 1.4）：提示行收敛——短提示 + "?" 操作卡（点击展开详细说明）。
+   替代原来 80 字常驻长提示，并补上"legend 可点击选数据""虚线=日志事件"说明。 */
+.drag-hint {
+  font-size: 11px; color: #546e7a; margin-bottom: 4px; text-align: right;
+  display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+}
+.hint-btn {
+  color: #4fc3f7; cursor: pointer; user-select: none; font-weight: 600;
+  border: 1px solid #263545; border-radius: 50%; width: 16px; height: 16px;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: 0 0 auto; line-height: 1; transition: border-color .15s;
+}
+.hint-btn:hover { border-color: #4fc3f7; }
+.hint-card {
+  position: absolute; right: 12px; top: 24px; z-index: 20;
+  background: #1a2530; border: 1px solid #263545; border-radius: 8px;
+  padding: 10px 14px; font-size: 12px; color: #b0bec5; line-height: 1.8;
+  text-align: left; box-shadow: 0 4px 16px rgba(0,0,0,.5);
+  white-space: nowrap; display: none;
+}
+.hint-card.show { display: block; }
+.hint-card b { color: #4fc3f7; font-weight: 600; }
 /* 自定义时间拖动条（PerfDog 风格 v28）：体积小、按下即拖 */
 .pd-slider { position: relative; height: 14px; margin-top: 5px; background: #101a26; border: 1px solid #263545; border-radius: 4px; user-select: none; touch-action: none; cursor: default; }
 .pd-wave { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
 .pd-selection { position: absolute; top: 1px; bottom: 1px; background: rgba(79,195,247,.28); border-left: 1px solid #4fc3f7; border-right: 1px solid #4fc3f7; border-radius: 2px; cursor: grab; }
 .pd-selection:active { cursor: grabbing; }
 .pd-handle { position: absolute; top: -4px; bottom: -4px; width: 7px; margin-left: -3.5px; background: #4fc3f7; border-radius: 2px; cursor: ew-resize; box-shadow: 0 0 5px rgba(79,195,247,.7); }
+/* v48（UI优化 3.1）：全局单时间条——汇总卡下方一条拖动条控制所有图表缩放，
+   替代原来 6 图各挂一条（功能全联动本就共享 _dz，只是挂点减 1）。
+   条比图下版更高更好抓，且粘性跟随滚动随时可拖。 */
+.global-slider-wrap {
+  position: sticky; top: 0; z-index: 15; margin-bottom: 12px;
+  background: rgba(16, 21, 28, .92); backdrop-filter: blur(4px);
+  padding: 8px 12px 6px; border: 1px solid #263545; border-radius: 8px;
+}
+.global-slider-wrap .pd-slider { height: 22px; }
 /* 点击锁定后标题行右侧的数据卡（V22 效果，与蓝线旁浮层并存） */
 .pin-data {
   display: none; font-size: 11px; color: #4fc3f7;
@@ -141,10 +173,20 @@ main { flex: 1; padding: 16px 20px; display: flex; flex-direction: column; gap: 
 .summary .item {
   background: #16212c; border: 1px solid #263545; border-radius: 8px;
   padding: 10px 14px;
+  /* v48（UI优化 2.4）：hover 轻微抬升反馈 */
+  transition: border-color .15s, transform .15s;
 }
+.summary .item:hover { border-color: #37506a; transform: translateY(-1px); }
 .summary .item .k { font-size: 11px; color: #78909c; white-space: nowrap; }
 .summary .item .v { font-size: 18px; color: #4fc3f7; font-weight: 600; margin-top: 2px; }
 .summary .item .v small { font-size: 11px; color: #78909c; font-weight: 400; }
+
+/* v48（UI优化 1.1）：核心 KPI 大卡 + 阈值语义着色。
+   色沿用深色主题柔和绿黄红（#a5d6a7/#ffd54f/#ef5350），非刺眼纯色。 */
+.summary .item.kpi { border-left-width: 3px; }
+.summary .item .v.kpi-good { color: #a5d6a7; }   /* 达标：柔和绿 */
+.summary .item .v.kpi-warn { color: #ffd54f; }   /* 临界：柔和黄 */
+.summary .item .v.kpi-bad  { color: #ef5350; }   /* 超标：柔和红 */
 
 footer {
   padding: 10px 20px; font-size: 12px; color: #546e7a;
@@ -177,6 +219,8 @@ footer a { color: #4fc3f7; text-decoration: none; }
 .run-item {
   padding: 8px 10px; border-radius: 6px; cursor: pointer;
   border: 1px solid transparent; margin-bottom: 6px;
+  /* v48（UI优化 2.4）：hover 底色变化加过渡，微交互更柔和 */
+  transition: background .15s, border-color .15s;
 }
 .run-item:hover { background: #1c2a38; }
 .run-item.active { background: #22374a; border-color: #4fc3f7; }
@@ -193,6 +237,42 @@ footer a { color: #4fc3f7; text-decoration: none; }
 }
 .run-meta { font-size: 11px; color: #78909c; margin-top: 3px; }
 .empty { color: #546e7a; font-size: 13px; padding: 12px 4px; }
+
+/* v48（UI优化 3.4）：深色 toast（右下浮层，2.5s 自消）——替代失败类 alert，
+   不打断看报告的操作流 */
+.pd-toast {
+  position: fixed; right: 20px; bottom: 24px; z-index: 100;
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-end;
+  pointer-events: none;
+}
+.pd-toast-item {
+  background: #1a2530; border: 1px solid #263545; border-left: 3px solid #4fc3f7;
+  color: #cfd8dc; font-size: 13px; padding: 10px 16px; border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.5); max-width: min(420px, 80vw);
+  animation: pd-toast-in .2s ease-out;
+}
+.pd-toast-item.err { border-left-color: #ef5350; }
+.pd-toast-item.ok { border-left-color: #a5d6a7; }
+@keyframes pd-toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* v48（UI优化 2.4）：新记录流入提示胶囊 */
+.new-runs-pill {
+  display: none; background: rgba(79,195,247,.14); border: 1px solid #4fc3f7;
+  color: #4fc3f7; font-size: 12px; border-radius: 12px; padding: 3px 10px;
+  margin-bottom: 8px; cursor: pointer; text-align: center;
+}
+
+/* v48（UI优化 1.2）：meta 区重排——被测应用/备注前置为大字，文件名降为灰字小行 */
+.report-meta .meta-primary { font-size: 14px; color: #cfd8dc; }
+.report-meta .meta-primary b { color: #4fc3f7; font-weight: 600; }
+.report-meta .meta-secondary { font-size: 12px; color: #607d8b; margin-top: 3px; }
+
+/* v48（UI优化 4.1）：列表项"打开报告"小图标 */
+.open-report-btn {
+  color: #4fc3f7; cursor: pointer; font-size: 12px; margin-left: 6px;
+  opacity: 0.55; flex: 0 0 auto; user-select: none;
+}
+.open-report-btn:hover { opacity: 1; }
 
 .report-main { flex: 1; min-width: 0; }
 .placeholder {
@@ -211,7 +291,8 @@ footer a { color: #4fc3f7; text-decoration: none; }
 
 @media (max-width: 900px) {
   .report-layout { flex-direction: column; }
-  .run-list { width: 100%; flex: none; max-height: 200px; }
+  /* v48（UI优化 5.1）：窄屏列表高度 200px→40vh——原 200px 仅 ~3 条记录，筛选长列表很痛苦 */
+  .run-list { width: 100%; flex: none; max-height: 40vh; }
 }
 
 /* 窄屏：顶部栏纵向堆叠，避免挤压重叠 */

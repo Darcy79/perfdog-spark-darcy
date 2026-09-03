@@ -359,34 +359,47 @@
   //   - 体积小（高 14px）；按下即拖，无需精确抓手柄
   //   - 两端细蓝色竖条 = 缩放；中间选区拖动 = 平移；点击选区外 = 窗口跳转到点击处
   //   - 拖动时图表实时跟随；所有图表共享同一窗口（一个拖动条操作全部联动）
+  // v48（UI优化 3.1）：支持"全局单条"模式——传 mountEl 时只建 1 个条挂到该容器
+  //   （所有图共用 _dz 状态，本就全联动），省去 6 份重复波形与 6 个挂点；
+  //   不传（老调用兼容）保持"每图一条"。
+  // v48（UI优化 3.2）：事件改 Pointer Events（mouse+touch 统一），触屏可用；
+  //   不支持 PointerEvent 的环境回退原 mouse 事件。
   var _dz = { start: 0, end: 100, charts: [], rows: [], sliders: [], n: 0 };
 
-  function createTimeSliders(charts, rows) {
+  function createTimeSliders(charts, rows, mountEl) {
     var list = [];
     if (Array.isArray(charts)) list = charts.filter(Boolean);
     else list = Object.keys(charts).map(function (k) { return charts[k]; }).filter(Boolean);
     if (!list.length || !rows.length) return;
-    // 清理旧拖动条
-    _dz.sliders.forEach(function (s) { if (s.el && s.el.parentNode) s.el.parentNode.removeChild(s.el); });
+    // 清理旧拖动条（含全局容器里的）
+    _dz.sliders.forEach(function (s) { if (s && s.parentNode) s.parentNode.removeChild(s); });
     _dz.sliders = [];
     _dz.charts = list;
     _dz.rows = rows;
     _dz.n = rows.length;
     _dz.start = 0;
     _dz.end = 100;
-    list.forEach(function (chart) {
-      if (!chart) return;
-      var el = _buildSlider(chart);
+    if (mountEl) {
+      // 全局单条：波形用首图数据（fps 通常最满），挂到指定容器
+      var el = _buildSlider(list[0]);
+      mountEl.appendChild(el);
       _dz.sliders.push(el);
-    });
+    } else {
+      list.forEach(function (chart) {
+        if (!chart) return;
+        var e = _buildSlider(chart);
+        var dom = chart.getDom();
+        if (dom.parentNode) dom.parentNode.appendChild(e);   // 老行为：每图卡内一条
+        _dz.sliders.push(e);
+      });
+    }
     _renderAllSliders();
   }
 
   function _buildSlider(chart) {
-    var dom = chart.getDom();
     var el = document.createElement('div');
     el.className = 'pd-slider';
-    el._chart = chart;
+    el._chart = chart;   // _drawWave 用它取首条系列数据画迷你波形
     var canvas = document.createElement('canvas');
     canvas.className = 'pd-wave';
     var sel = document.createElement('div');
@@ -399,15 +412,21 @@
     el.appendChild(sel);
     el.appendChild(hl);
     el.appendChild(hr);
-    // 插到图表容器下方（卡片内）
-    if (dom.parentNode) dom.parentNode.appendChild(el);
-    _bindSlider(el, canvas);
+    _bindSlider(el);
     return el;
   }
 
-  function _bindSlider(el, canvas) {
-    el.addEventListener('mousedown', function (e) {
+  function _bindSlider(el) {
+    // v48（UI优化 3.2）：Pointer Events 统一 mouse/touch；capture 指针后
+    // 拖出元素外也能收到 move；touch-action:none 已在 .pd-slider 上（防页面滚动抢手势）
+    var hasPointer = typeof window.PointerEvent !== 'undefined';
+    var down = hasPointer ? 'pointerdown' : 'mousedown';
+    var move = hasPointer ? 'pointermove' : 'mousemove';
+    var up = hasPointer ? 'pointerup' : 'mouseup';
+    el.addEventListener(down, function (e) {
+      if (hasPointer && e.isPrimary === false) return;   // 多指：只用首个触点
       e.preventDefault();
+      try { el.setPointerCapture(e.pointerId); } catch (err) {}
       var rect = el.getBoundingClientRect();
       if (rect.width <= 0) return;
       var ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -450,23 +469,25 @@
         _syncDragUI();   // v29：rAF 节流合并渲染，避免 mousemove 高频触发 6 图重绘
       }
       function onUp() {
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup', onUp);
+        document.removeEventListener(move, onMove);
+        document.removeEventListener(up, onUp);
         _applyZoom();   // v30：松手强制应用最终窗口（防最后奇数帧图表未更新）
       }
-      document.addEventListener('mousemove', onMove);
-      document.addEventListener('mouseup', onUp);
+      document.addEventListener(move, onMove);
+      document.addEventListener(up, onUp);
       _syncDragUI();
     });
     // 画迷你波形
-    _drawWave(el, canvas);
+    _drawWave(el);
   }
 
-  function _drawWave(el, canvas) {
+  function _drawWave(el) {
     try {
       var chart = el._chart;
       var opt = chart.getOption();
       var data = (opt.series && opt.series[0] && opt.series[0].data) || [];
+      var canvas = el.querySelector('.pd-wave');
+      if (!canvas) return;
       var w = canvas.clientWidth || el.clientWidth || 0;
       var h = canvas.clientHeight || el.clientHeight || 0;
       if (!w || !h || !data.length) return;
@@ -841,11 +862,15 @@
   function renderTemp(chart, rows, zoom) {
     var temp = series(rows, function (r) { return r.therm ? r.therm.temp_c : null; });
     var power = series(rows, function (r) { return r.therm ? r.therm.power_w : null; });
+    // v48（UI优化 2.3）：温度下界按数据自适应——原固定 25 在冬天/散热好的机型上
+    // 会把曲线截断贴底；取数据最小值-2，无数据回退 25
+    var tMin = min(temp);
+    var tempAxisMin = (tMin != null) ? Math.floor(tMin - 2) : 25;
     chart.setOption({
       ...baseOption(zoom),
       yAxis: [
         { type: 'value', name: '°C', nameLocation: 'middle', nameGap: 36,
-          min: 25, axisLabel: { fontSize: 10 } },
+          min: tempAxisMin, axisLabel: { fontSize: 10 } },
         { type: 'value', name: 'W', nameLocation: 'middle', nameGap: 36,
           min: 0, axisLabel: { fontSize: 10 }, splitLine: { show: false } },
       ],
@@ -918,6 +943,11 @@
   // ---------------- 统计汇总 ----------------
   function computeStats(rows) {
     var fps = series(rows, function (r) { return r.fps ? r.fps.fps : null; });
+    // v48（UI优化 4.6）：静止段（fps==0，合法画面非性能问题）不入"最低帧率"统计
+    var fpsActive = series(rows, function (r) {
+      var v = r.fps ? r.fps.fps : null;
+      return (typeof v === 'number' && isFinite(v) && v > 0) ? v : null;
+    });
     var jank = series(rows, function (r) {
       return r.fps && r.fps.jank_rate != null ? r.fps.jank_rate * 100 : null;
     });
@@ -928,14 +958,25 @@
     });
     var temp = series(rows, function (r) { return r.therm ? r.therm.temp_c : null; });
     var durS = rows.length ? Math.round((rows[rows.length - 1].t_ms || 0) / 1000) : 0;
+    // v48（UI优化 1.1）：众数刷新率 → KPI 分级的"满帧 / 帧时间阈值"基准（无则 60）
+    var hzCount = {};
+    rows.forEach(function (r) {
+      var f = r.fps && r.fps.refresh_hz;
+      if (typeof f === 'number' && isFinite(f)) hzCount[f] = (hzCount[f] || 0) + 1;
+    });
+    var refresh_hz = null, bestCnt = 0;
+    Object.keys(hzCount).forEach(function (k) {
+      if (hzCount[k] > bestCnt) { bestCnt = hzCount[k]; refresh_hz = Number(k); }
+    });
     return {
       count: rows.length, durS: durS,
-      fps_avg: avg(fps), fps_min: min(fps), fps_p95: p95(fps),
+      fps_avg: avg(fps), fps_min: min(fps), fps_min_active: min(fpsActive), fps_p95: p95(fps),
       jank_avg: avg(jank),
       ft_p95_avg: avg(ftP95),
       cpu_avg: avg(cpuProc),
       pss_peak: max(pss), pss_avg: avg(pss),
       temp_avg: avg(temp),
+      refresh_hz: refresh_hz,
     };
   }
 
@@ -943,21 +984,59 @@
     var el = document.getElementById(elId);
     if (!el || !stats) return;
     function fmt(v, d) { return (typeof v === 'number' && isFinite(v)) ? Number(v).toFixed(d) : '-'; }
-    function item(k, v, small) {
-      return '<div class="item"><div class="k">' + k + '</div><div class="v">' + v +
+    // v48（UI优化 1.1）：KPI 语义化分级 + 阈值着色（阈值取自 指标说明.md §1/§2/§12）
+    var hz = (typeof stats.refresh_hz === 'number' && isFinite(stats.refresh_hz)) ? stats.refresh_hz : 60;
+    var period = 1000 / hz;                     // 刷新周期（ms）
+    // FPS：满帧(±5%)绿 / ≥30 黄 / <30 红
+    function fpsGrade(v) {
+      if (v == null) return '';
+      if (v >= hz * 0.95) return 'kpi-good';
+      if (v >= 30) return 'kpi-warn';
+      return 'kpi-bad';
+    }
+    // Jank：<1% 绿 / 1~5% 黄 / >5% 红
+    function jankGrade(v) {
+      if (v == null) return '';
+      if (v < 1) return 'kpi-good';
+      if (v <= 5) return 'kpi-warn';
+      return 'kpi-bad';
+    }
+    // 帧时间 P95：≤2×周期 绿 / ≤4×周期 黄 / >4×周期 红
+    function ftGrade(v) {
+      if (v == null) return '';
+      if (v <= 2 * period) return 'kpi-good';
+      if (v <= 4 * period) return 'kpi-warn';
+      return 'kpi-bad';
+    }
+    // 温度：<40 绿 / 40~45 黄 / >45 红
+    function tempGrade(v) {
+      if (v == null) return '';
+      if (v < 40) return 'kpi-good';
+      if (v <= 45) return 'kpi-warn';
+      return 'kpi-bad';
+    }
+    // 统一卡片构造：hero=核心 KPI（大卡）；grade 着色 .v
+    function build(k, v, small, grade, hero) {
+      return '<div class="item' + (hero ? ' kpi' : '') + '">' +
+        '<div class="k">' + k + '</div>' +
+        '<div class="v ' + (grade || '') + '">' + v +
         (small ? '<small> ' + small + '</small>' : '') + '</div></div>';
     }
+    var fpsMinActive = stats.fps_min_active != null ? stats.fps_min_active : stats.fps_min;
     el.innerHTML =
-      item('平均帧率', fmt(stats.fps_avg, 1), 'FPS') +
-      item('最低帧率', fmt(stats.fps_min, 1), 'FPS') +
-      item('P95 帧率', fmt(stats.fps_p95, 1), 'FPS') +
-      item('卡顿率', fmt(stats.jank_avg, 2), '%') +
-      item('帧时间 P95', fmt(stats.ft_p95_avg, 1), 'ms') +
-      item('平均进程CPU', fmt(stats.cpu_avg, 1), '%') +
-      item('峰值内存', fmt(stats.pss_peak, 1), 'MB (PSS)') +
-      item('平均内存', fmt(stats.pss_avg, 1), 'MB (PSS)') +
-      item('平均温度', fmt(stats.temp_avg, 1), '°C') +
-      item('采集时长', stats.durS + ' s', stats.count + ' 个采样点');
+      // 核心 KPI 置顶（大卡 + 阈值着色）——第一眼回答"这次测得好不好"
+      build('平均帧率', fmt(stats.fps_avg, 1), '/ 满帧 ' + hz, fpsGrade(stats.fps_avg), true) +
+      build('卡顿率', fmt(stats.jank_avg, 2), '%', jankGrade(stats.jank_avg), true) +
+      build('帧时间 P95', fmt(stats.ft_p95_avg, 1), 'ms', ftGrade(stats.ft_p95_avg), true) +
+      // 次要指标
+      build('最低帧率(除静止)', fmt(fpsMinActive, 1), 'FPS') +
+      build('P95 帧率', fmt(stats.fps_p95, 1), 'FPS') +
+      build('平均进程CPU', fmt(stats.cpu_avg, 1), '%') +
+      build('峰值内存', fmt(stats.pss_peak, 1), 'MB (PSS)') +
+      build('平均内存', fmt(stats.pss_avg, 1), 'MB (PSS)') +
+      build('平均温度', fmt(stats.temp_avg, 1), '°C', tempGrade(stats.temp_avg)) +
+      // v48（UI优化 1.1）：时长/点数降为元信息
+      build('采集时长', stats.durS + ' s', stats.count + ' 点');
   }
 
   // ---------------- 事件标注层（2026-08-14 模式1：logcat console.log 叠加） ----------------
