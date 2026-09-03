@@ -198,10 +198,14 @@ footer a { color: #4fc3f7; text-decoration: none; }
 .report-layout { flex-direction: row; align-items: stretch; gap: 16px; }
 .run-list {
   width: 300px; flex: 0 0 300px;
-  background: #16212c; border: 1px solid #263545; border-radius: 8px;
-  padding: 12px; max-height: calc(100vh - 160px); overflow-y: auto;
-  /* v49（需求 B）：sticky 常驻视口——页面往下翻报告时左侧历史列表不滚走，
-     从根上消除"左侧历史报告框突然没了"的空旷感（优于透明化的正解）。
+  /* v50（去卡片化）：去掉深色底/边框/圆角——容器完全透明，融入页面背景；
+     列表项分隔靠 run-item 的 hover/active + 间距，不需要容器卡片。
+     左列与右内容的分界：靠右缘 1px 极淡竖线（box-shadow inset 不占布局宽度）。 */
+  background: transparent;
+  padding: 2px 12px 2px 0;
+  box-shadow: inset -1px 0 0 #263545;
+  max-height: calc(100vh - 160px); overflow-y: auto;
+  /* v49（需求 B）：sticky 常驻视口——页面往下翻报告时左侧历史列表不滚走。
      align-self:flex-start 让 sticky 在 flex 行内生效（否则 stretch 会拉满全高失效）。 */
   position: sticky; top: 12px; align-self: flex-start;
 }
