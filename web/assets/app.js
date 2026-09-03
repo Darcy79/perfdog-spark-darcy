@@ -1034,9 +1034,9 @@
       build('平均进程CPU', fmt(stats.cpu_avg, 1), '%') +
       build('峰值内存', fmt(stats.pss_peak, 1), 'MB (PSS)') +
       build('平均内存', fmt(stats.pss_avg, 1), 'MB (PSS)') +
-      build('平均温度', fmt(stats.temp_avg, 1), '°C', tempGrade(stats.temp_avg)) +
-      // v48（UI优化 1.1）：时长/点数降为元信息
-      build('采集时长', stats.durS + ' s', stats.count + ' 点');
+      build('平均温度', fmt(stats.temp_avg, 1), '°C', tempGrade(stats.temp_avg));
+    // v49（需求 A）：删除"采集时长"元信息卡——时长/点数已移到报告标题行
+    // （report.html selectRun 内拼入 meta-primary），汇总卡区不再显示，避免换行难看。
   }
 
   // ---------------- 事件标注层（2026-08-14 模式1：logcat console.log 叠加） ----------------

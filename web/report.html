@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=48">
+<link rel="stylesheet" href="/assets/style.css?v=49">
 </head>
 <body>
 <header>
@@ -32,6 +32,8 @@
 
   <section class="report-main">
     <div id="report-placeholder" class="placeholder">← 左侧选择一条采集记录查看报告</div>
+    <!-- v49（需求 C）：双报告对比轻量面板——独立于 report-body，切换单报告时不闪失/不冲突 -->
+    <div id="compare-panel" class="compare-panel" style="display:none"></div>
     <div id="report-body" style="display:none">
       <div class="report-meta" id="report-meta"></div>
       <!-- v48（UI优化 1.4/3.5）：提示行收敛为短提示 + "?" 操作卡（含 legend 选数据、虚线=日志事件说明） -->
@@ -83,8 +85,8 @@
 <!-- v48（UI优化 3.4）：深色 toast 浮层（替代失败类 alert） -->
 <div class="pd-toast" id="pd-toast"></div>
 
-<script src="/assets/echarts.min.js?v=48"></script>
-<script src="/assets/app.js?v=48"></script>
+<script src="/assets/echarts.min.js?v=49"></script>
+<script src="/assets/app.js?v=49"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -92,6 +94,9 @@
   var allRuns = [];
   var lastRunsSig = null;   // 历史列表变化签名（v36：无变化时不重建 DOM，避免每 5s 轮询闪动）
   var loadingSeq = 0;       // 报告加载序号：连续快速切换时，慢响应回来不再覆盖新报告
+  // v49（需求 C）：对比选择状态——最多选 2 条，按选中先后顺序存放（不自动排序，面板内再按 mtime 排）
+  var compareSel = [];
+  var compareSeq = 0;       // 对比加载序号：快速切换时丢弃慢响应（同 loadingSeq）
   // 报告区加载状态（v38 "加载完再显示"：切换期间报告区显示加载文字，渲染完成后一次性显示）
   var PH_LOADING = '⏳ 正在加载报告…';
   var PH_DEFAULT = '← 左侧选择一条采集记录查看报告';
@@ -100,6 +105,15 @@
     var el = document.getElementById('report-placeholder');
     el.textContent = text;
     el.style.display = show ? 'flex' : 'none';
+  }
+
+  // v49（需求 A）：秒 → 时长文本。≥1h 用 H:MM:SS，<1h 用 MM:SS；无/异常显示 00:00
+  function fmtDuration(sec) {
+    var s = (typeof sec === 'number' && isFinite(sec) && sec >= 0) ? Math.floor(sec) : 0;
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    if (h > 0) return h + ':' + p(m) + ':' + p(ss);
+    return p(m) + ':' + p(ss);
   }
 
   // v48（UI优化 3.4）：深色 toast（右下 2.5s 自消）——失败类提示不再用 alert 打断操作流
@@ -203,6 +217,16 @@
         renameRun(run.name, run.remark);
       };
       nameRow.appendChild(renameBtn);
+      // v49（需求 C）：对比选择入口——☑ 图标，stopPropagation 避免触发 selectRun
+      var cmpBtn = document.createElement('span');
+      cmpBtn.className = 'compare-btn' + (compareSel.indexOf(run.name) >= 0 ? ' on' : '');
+      cmpBtn.title = '选择加入对比（最多 2 条）';
+      cmpBtn.textContent = compareSel.indexOf(run.name) >= 0 ? '☑' : '☐';
+      cmpBtn.onclick = function (e) {
+        e.stopPropagation();
+        toggleCompare(run.name);
+      };
+      nameRow.appendChild(cmpBtn);
       el.appendChild(nameRow);
       var metaRow = document.createElement('div');
       metaRow.className = 'run-meta';
@@ -261,6 +285,8 @@
         var dataRows = prepared.rows;
         var cores = prepared.cores;
         var device = prepared.device;
+        // v49（需求 A）：提前算一次 stats，供标题行"时长/点数"与 renderSummary 复用，避免重复计算
+        var stats = window.PerfCharts.computeStats(dataRows);
         // 被测应用：从每行 target 提取（支持中途热切换显示分界）
         var targets = [];
         var lastT = null;
@@ -274,8 +300,8 @@
             tdesc += ' → ' + targets[i].pkg + '(@' + Math.round(targets[i].t / 1000) + 's)';
           }
         }
-        // v48（UI优化 1.2）：meta 重排——备注(无则文件名)+被测应用前置为大字，
-        // 文件名/点数/核数降为灰字小行。全部 createElement+textContent 构建（免疫注入）。
+        // v49（需求 A）：meta 重排——标题行 = 备注(或文件名) · 被测 · 时长 · N点；
+        // 文件名降为灰字小行（仅文件名，去掉点数/核数——核数已由下方芯片行展示）。
         var metaEl = document.getElementById('report-meta');
         metaEl.textContent = '';   // 清空旧内容（含上次设备行）
         var remark = '';
@@ -292,11 +318,18 @@
           tgt.textContent = ' · 被测 ' + tdesc;
           primary.appendChild(tgt);
         }
+        // v49（需求 A）：时长 + 采样点跟在被测后面（次级浅色小字），不换行截断、允许自然折行
+        var durSpan = document.createElement('span');
+        durSpan.className = 'meta-sub';
+        durSpan.textContent = ' · 时长 ' + fmtDuration(stats.durS);
+        primary.appendChild(durSpan);
+        var ptsSpan = document.createElement('span');
+        ptsSpan.className = 'meta-sub';
+        ptsSpan.textContent = ' · ' + stats.count + ' 点';
+        primary.appendChild(ptsSpan);
         var secondary = document.createElement('div');
         secondary.className = 'meta-secondary';
-        var secTxt = name + ' · ' + dataRows.length + ' 个采样点';
-        if (cores) secTxt += ' · ' + cores + ' 核';
-        secondary.textContent = secTxt;
+        secondary.textContent = name;   // v49：只保留文件名，去掉"采样点/核数"
         metaEl.appendChild(primary);
         metaEl.appendChild(secondary);
         // v47：设备信息分行分字段显示（原为扎堆一行）。全部用 createElement +
@@ -333,7 +366,7 @@
         }
         window.PerfCharts.renderAll(charts, dataRows, { zoom: true });
         window.PerfCharts.updateStats(charts, dataRows);
-        window.PerfCharts.renderSummary('report-summary', window.PerfCharts.computeStats(dataRows));
+        window.PerfCharts.renderSummary('report-summary', stats);   // v49：复用上面算好的 stats
         window.PerfCharts.clearPin();   // 切换报告时清除上一份的锁定贯穿线
         window.PerfCharts.setPinData(dataRows); // 供点击锁定显示各模块时刻数据
         // v48（UI优化 3.1）：全局单时间条（挂在汇总卡上方，控制全部图表缩放）
@@ -365,6 +398,152 @@
           ? '无法连接看板服务（服务可能已关闭或端口变更），请重新启动看板后刷新本页。'
           : '读取失败: ' + e, 'err');   // v48（UI优化 3.4）：toast 替代 alert
       });
+  }
+
+  // ============ v49（需求 C）：双报告对比（轻量版：两列 KPI + 差值着色） ============
+  // 轻量版只做并排 KPI 对比 + Δ 方向着色，不做曲线同图叠加（完整版后续再说）。
+  // 排序约定：按 mtime 排序，较旧 = "上次"（左列），较新 = "本次"（右列），Δ = 本次 − 上次。
+  function toggleCompare(name) {
+    var idx = compareSel.indexOf(name);
+    if (idx >= 0) {
+      compareSel.splice(idx, 1);   // 取消选择
+    } else {
+      if (compareSel.length >= 2) compareSel.shift();   // 已满 2 条 → 替换最早选中的那条
+      compareSel.push(name);
+    }
+    renderRuns();                    // 刷新列表项 ☑ 状态
+    if (compareSel.length === 2) renderCompare();
+    else {
+      var panel = document.getElementById('compare-panel');
+      if (panel) { panel.style.display = 'none'; panel.innerHTML = ''; }
+      // v49 补漏：对比收起后，若尚未打开任何单报告，恢复占位提示（避免报告区空白）
+      var bodyEl = document.getElementById('report-body');
+      if (bodyEl && bodyEl.style.display !== 'block') setPlaceholder(PH_DEFAULT, true);
+    }
+  }
+
+  function clearCompare() {
+    compareSel = [];
+    renderRuns();
+    var panel = document.getElementById('compare-panel');
+    if (panel) { panel.style.display = 'none'; panel.innerHTML = ''; }
+    // v49 补漏：同上——未开单报告时恢复占位提示
+    var bodyEl = document.getElementById('report-body');
+    if (bodyEl && bodyEl.style.display !== 'block') setPlaceholder(PH_DEFAULT, true);
+  }
+
+  // 差值着色容差：|Δ| 相对基准(上次值)的 1%，低于此视为"基本持平"用中性灰，避免抖动变色
+  function _cmpDeltaClass(delta, base, higherBetter) {
+    if (delta == null || base == null || !isFinite(delta) || !isFinite(base)) return 'cmp-neutral';
+    var tol = Math.abs(base) * 0.01;
+    if (Math.abs(delta) <= tol) return 'cmp-neutral';
+    var improved = higherBetter ? delta > 0 : delta < 0;
+    return improved ? 'cmp-good' : 'cmp-bad';
+  }
+
+  function _cmpCell(v, unit, digits) {
+    if (v == null || !isFinite(v)) return '-';
+    return Number(v).toFixed(digits != null ? digits : 1) + (unit || '');
+  }
+
+  // v49 补漏：对比面板头部标题含用户备注/文件名（rename 备注来自用户输入），
+  // innerHTML 拼接前必须转义——与全站"createElement + textContent 免疫注入"策略一致。
+  function escHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function renderCompare() {
+    var panel = document.getElementById('compare-panel');
+    if (!panel) return;
+    // 对比面板显示时收起占位提示（未选单报告时占位符会与面板重叠）
+    setPlaceholder(PH_DEFAULT, false);
+    var seq = ++compareSeq;
+    // 按 mtime 排序：较旧 = 上次（左），较新 = 本次（右）
+    var sel = compareSel.slice().sort(function (a, b) {
+      var ra = allRuns.filter(function (r) { return r.name === a; })[0];
+      var rb = allRuns.filter(function (r) { return r.name === b; })[0];
+      return (ra && rb) ? (ra.mtime < rb.mtime ? -1 : 1) : 0;
+    });
+    var oldName = sel[0], newName = sel[1];
+    panel.innerHTML = '<div class="cmp-loading">⏳ 正在加载对比数据…</div>';
+    panel.style.display = 'block';
+
+    var loads = sel.map(function (name) {
+      return fetch('/api/report?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); });
+    });
+    Promise.all(loads).then(function (results) {
+      if (seq !== compareSeq) return;   // 已有更新的对比请求，丢弃慢响应
+      if (!Array.isArray(results[0]) || !Array.isArray(results[1])) {
+        toast('对比数据读取失败', 'err');
+        return;
+      }
+      var s0 = window.PerfCharts.computeStats(window.PerfCharts.prepareRows(results[0]).rows);
+      var s1 = window.PerfCharts.computeStats(window.PerfCharts.prepareRows(results[1]).rows);
+      var meta0 = allRuns.filter(function (r) { return r.name === oldName; })[0] || {};
+      var meta1 = allRuns.filter(function (r) { return r.name === newName; })[0] || {};
+
+      // 指标行定义：{label, get(stats), unit, digits, higherBetter}；higherBetter=null 表示不方向着色
+      var ROWS = [
+        { label: '平均帧率', get: function (s) { return s.fps_avg; }, unit: '', digits: 1, higherBetter: true },
+        { label: '卡顿率', get: function (s) { return s.jank_avg; }, unit: '%', digits: 2, higherBetter: false },
+        { label: '帧时间 P95', get: function (s) { return s.ft_p95_avg; }, unit: 'ms', digits: 1, higherBetter: false },
+        { label: '最低帧率(除静止)', get: function (s) { return s.fps_min_active != null ? s.fps_min_active : s.fps_min; }, unit: 'FPS', digits: 1, higherBetter: true },
+        { label: '平均进程CPU', get: function (s) { return s.cpu_avg; }, unit: '%', digits: 1, higherBetter: null },
+        { label: '峰值内存(PSS)', get: function (s) { return s.pss_peak; }, unit: 'MB', digits: 1, higherBetter: null },
+        { label: '平均温度', get: function (s) { return s.temp_avg; }, unit: '°C', digits: 1, higherBetter: false },
+        { label: '采集时长', get: function (s) { return s.durS; }, unit: '', digits: null, higherBetter: null, asDuration: true },
+        { label: '采样点数', get: function (s) { return s.count; }, unit: '', digits: 0, higherBetter: null },
+      ];
+
+      function cellHtml(s, row) {
+        if (row.asDuration) return fmtDuration(row.get(s));
+        return _cmpCell(row.get(s), row.unit, row.digits);
+      }
+
+      var rowsHtml = ROWS.map(function (row) {
+        var v0 = row.get(s0), v1 = row.get(s1);
+        var delta = (v0 != null && v1 != null && isFinite(v0) && isFinite(v1) && !row.asDuration)
+          ? v1 - v0 : null;
+        var dClass = row.higherBetter != null && delta != null
+          ? _cmpDeltaClass(delta, v0, row.higherBetter)
+          : 'cmp-neutral';
+        var dText = row.asDuration
+          ? ''   // 时长差值省略（头部已显示各自时长）
+          : (delta == null ? '—' : (delta > 0 ? '+' : '') + Number(delta).toFixed(row.digits != null ? row.digits : 1));
+        return '<div class="cmp-row">' +
+          '<div class="cmp-label">' + row.label + '</div>' +
+          '<div class="cmp-val">' + cellHtml(s0, row) + '</div>' +
+          '<div class="cmp-val">' + cellHtml(s1, row) + '</div>' +
+          '<div class="cmp-delta ' + dClass + '">' + dText + '</div>' +
+          '</div>';
+      }).join('');
+
+      var title0 = escHtml(meta0.remark || oldName.replace(/^.*\//, '')) + ' <span class="cmp-meta">' + escHtml(meta0.mtime || '') + '</span>';
+      var title1 = escHtml(meta1.remark || newName.replace(/^.*\//, '')) + ' <span class="cmp-meta">' + escHtml(meta1.mtime || '') + '</span>';
+
+      panel.innerHTML =
+        '<div class="cmp-head">' +
+          '<strong class="cmp-title">📊 报告对比</strong>' +
+          '<span class="cmp-hint">上次 → 本次 · 绿=改善 红=退化</span>' +
+          '<span class="cmp-close" id="cmp-close" title="关闭对比">✕</span>' +
+        '</div>' +
+        '<div class="cmp-grid">' +
+          '<div class="cmp-cols-head">' +
+            '<div class="cmp-label"></div>' +
+            '<div class="cmp-col-head">上次<br>' + title0 + '</div>' +
+            '<div class="cmp-col-head">本次<br>' + title1 + '</div>' +
+            '<div class="cmp-col-head cmp-delta">Δ</div>' +
+          '</div>' +
+          rowsHtml +
+        '</div>';
+      var closeBtn = document.getElementById('cmp-close');
+      if (closeBtn) closeBtn.onclick = clearCompare;
+    }).catch(function (e) {
+      if (seq !== compareSeq) return;
+      toast('对比数据读取失败', 'err');
+    });
   }
 
   // 筛选控件：输入/切换即时过滤（关键词防抖：输入停顿 200ms 后生效）

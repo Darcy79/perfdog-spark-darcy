@@ -200,6 +200,10 @@ footer a { color: #4fc3f7; text-decoration: none; }
   width: 300px; flex: 0 0 300px;
   background: #16212c; border: 1px solid #263545; border-radius: 8px;
   padding: 12px; max-height: calc(100vh - 160px); overflow-y: auto;
+  /* v49（需求 B）：sticky 常驻视口——页面往下翻报告时左侧历史列表不滚走，
+     从根上消除"左侧历史报告框突然没了"的空旷感（优于透明化的正解）。
+     align-self:flex-start 让 sticky 在 flex 行内生效（否则 stretch 会拉满全高失效）。 */
+  position: sticky; top: 12px; align-self: flex-start;
 }
 .run-list h3 { font-size: 14px; color: #4fc3f7; margin-bottom: 8px; }
 
@@ -266,6 +270,8 @@ footer a { color: #4fc3f7; text-decoration: none; }
 .report-meta .meta-primary { font-size: 14px; color: #cfd8dc; }
 .report-meta .meta-primary b { color: #4fc3f7; font-weight: 600; }
 .report-meta .meta-secondary { font-size: 12px; color: #607d8b; margin-top: 3px; }
+/* v49（需求 A）：标题行次级片段（时长/点数）——比 b 浅的小灰字，允许自然折行 */
+.report-meta .meta-sub { font-size: 12px; color: #78909c; font-weight: 400; }
 
 /* v48（UI优化 4.1）：列表项"打开报告"小图标 */
 .open-report-btn {
@@ -273,6 +279,13 @@ footer a { color: #4fc3f7; text-decoration: none; }
   opacity: 0.55; flex: 0 0 auto; user-select: none;
 }
 .open-report-btn:hover { opacity: 1; }
+/* v49（需求 C）：列表项"加入对比"勾选图标 */
+.compare-btn {
+  color: #78909c; cursor: pointer; font-size: 13px; margin-left: auto;
+  flex: 0 0 auto; user-select: none; padding: 0 2px; line-height: 1;
+}
+.compare-btn:hover { color: #4fc3f7; }
+.compare-btn.on { color: #4fc3f7; }
 
 .report-main { flex: 1; min-width: 0; }
 .placeholder {
@@ -289,10 +302,44 @@ footer a { color: #4fc3f7; text-decoration: none; }
 .dev-info-label { color: #78909c; }
 .dev-info-value { color: #90a4ae; }
 
+/* v49（需求 C）：双报告对比轻量面板 */
+.compare-panel {
+  background: #16212c; border: 1px solid #263545; border-radius: 8px;
+  padding: 12px 14px; margin-bottom: 16px;
+}
+.compare-panel .cmp-head {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 10px;
+}
+.compare-panel .cmp-title { color: #4fc3f7; font-size: 14px; font-weight: 600; }
+.compare-panel .cmp-hint { font-size: 11px; color: #78909c; }
+.compare-panel .cmp-close {
+  margin-left: auto; color: #78909c; cursor: pointer; font-size: 14px;
+  padding: 0 4px; user-select: none; flex: 0 0 auto;
+}
+.compare-panel .cmp-close:hover { color: #ef5350; }
+.cmp-grid { display: flex; flex-direction: column; }
+.cmp-row, .cmp-cols-head {
+  display: grid; grid-template-columns: 1.1fr 1fr 1fr 0.7fr; gap: 8px;
+  align-items: center; padding: 6px 2px; border-bottom: 1px solid #263545;
+}
+.cmp-cols-head { border-bottom: 2px solid #263545; align-items: start; }
+.cmp-label { font-size: 12px; color: #78909c; }
+.cmp-col-head { font-size: 12px; color: #cfd8dc; line-height: 1.5; word-break: break-all; }
+.cmp-col-head.cmp-delta { color: #78909c; }
+.cmp-meta { color: #607d8b; font-size: 11px; font-weight: 400; }
+.cmp-val { font-size: 13px; color: #cfd8dc; font-variant-numeric: tabular-nums; }
+.cmp-delta { font-size: 12px; font-weight: 600; text-align: center; font-variant-numeric: tabular-nums; }
+.cmp-delta.cmp-good { color: #a5d6a7; }      /* 改善：柔和绿 */
+.cmp-delta.cmp-bad { color: #ef5350; }       /* 退化：柔和红 */
+.cmp-delta.cmp-neutral { color: #78909c; }   /* 基本持平/中性 */
+.cmp-loading { color: #78909c; font-size: 13px; padding: 8px 0; }
+
 @media (max-width: 900px) {
   .report-layout { flex-direction: column; }
   /* v48（UI优化 5.1）：窄屏列表高度 200px→40vh——原 200px 仅 ~3 条记录，筛选长列表很痛苦 */
   .run-list { width: 100%; flex: none; max-height: 40vh; }
+  /* v49（需求 B）：窄屏（≤900px 列表在上）重置 sticky 为 static，保证不破布局 */
+  .run-list { position: static; }
 }
 
 /* 窄屏：顶部栏纵向堆叠，避免挤压重叠 */
