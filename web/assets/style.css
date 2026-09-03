@@ -355,3 +355,21 @@ footer a { color: #4fc3f7; text-decoration: none; }
   .chart-head { flex-direction: column; align-items: flex-start; }
   .stat-line { text-align: left; width: 100%; }
 }
+
+/* v51（滚动条美化）：深色主题下系统默认滚动条很扎眼，改细 + 常态半透明淡色、
+   悬停变亮提示可拖。全局生效（不限定 .run-list），body 页面滚动条一并美化。
+   只做视觉，绝不隐藏滚动能力（不 width:0 / display:none）。 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 144, 156, 0.35);   /* #78909c 35% 半透明，常态几乎不抢眼 */
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover,
+::-webkit-scrollbar-thumb:active {
+  background: rgba(120, 144, 156, 0.65);   /* hover/拖拽变亮，提示可交互 */
+}
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* Firefox：thin + scrollbar-color（继承到所有滚动容器，含 .run-list / body） */
+html { scrollbar-width: thin; scrollbar-color: rgba(120, 144, 156, 0.35) transparent; }
