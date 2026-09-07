@@ -290,32 +290,41 @@
   function setPinHook(fn) { _pinHook = (typeof fn === 'function') ? fn : null; }
   function _pinNotify(snapshot) { if (_pinHook) { try { _pinHook(snapshot); } catch (e) {} } }
 
-  // 拼锁定时刻的全指标快照文本（口径与 _PIN_FIELDS 完全同源，各图字段合并成一行流）。
-  // 返回 { t: '12.3s', text: 'FPS 59.9 · Jank 3.0% · P95 16.8ms · ...' }；无行数据返回 null。
+  // 拼锁定时刻的全指标快照（口径与 _PIN_FIELDS 完全同源，数值/文本一致）。
+  // v54（可读性）：按模块分组多行——groups 顺序固定（FPS→帧时间→CPU→内存→网络→温度），
+  // 组内仍按数值降序。返回 { t:'12.3s', groups:[{name,text},...], text:'...'(兼容拼接) }；
+  // 无行数据/无任何有效指标返回 null。
   function _buildPinSnapshot(row) {
     if (!row) return null;
     var f = row.fps || {}, c = row.cpu || {}, m = row.mem || {}, n = row.net || {}, th = row.therm || {};
-    // 每项 [数值, 文本]；数值仅用于排序（与 _pinSortParts 同口径），null 项过滤
-    var items = [];
-    function push(v, text) { if (v != null && isFinite(v)) items.push([v, text]); }
-    push(f.fps, 'FPS ' + f.fps);
-    if (f.jank_rate != null) push(f.jank_rate * 100, 'Jank ' + (f.jank_rate * 100).toFixed(1) + '%');
-    push(f.frame_p50_ms, 'P50 ' + f.frame_p50_ms + 'ms');
-    push(f.frame_p95_ms, 'P95 ' + f.frame_p95_ms + 'ms');
-    push(f.frame_max_ms, 'Max ' + f.frame_max_ms + 'ms');
-    push(c.cpu_total_pct, 'CPU总 ' + c.cpu_total_pct + '%');
-    push(c.cpu_proc_pct, 'CPU进程 ' + c.cpu_proc_pct + '%');
-    if (_cores && c.cpu_proc_pct != null) push(c.cpu_proc_pct / _cores, '占整机 ' + (c.cpu_proc_pct / _cores).toFixed(1) + '%');
-    if (m.pss_kb != null) push(m.pss_kb / 1024, 'PSS ' + (m.pss_kb / 1024).toFixed(1) + 'MB');
-    if (m.vmrss_kb != null) push(m.vmrss_kb / 1024, 'RSS ' + (m.vmrss_kb / 1024).toFixed(1) + 'MB');
-    push(n.rx_kbps, '↓' + n.rx_kbps + 'KB/s');
-    push(n.tx_kbps, '↑' + n.tx_kbps + 'KB/s');
-    push(th.temp_c, th.temp_c + '°C');
-    push(th.voltage_v, th.voltage_v + 'V');
-    if (!items.length) return null;
-    items.sort(function (a, b) { return b[0] - a[0]; });
+    // 每项 [数值, 文本]；数值仅用于组内排序（与 _pinSortParts 同口径），null 项过滤
+    function push(arr, v, text) { if (v != null && isFinite(v)) arr.push([v, text]); }
+    function group(name, arr) {
+      arr.sort(function (a, b) { return b[0] - a[0]; });
+      return arr.length ? { name: name, text: arr.map(function (it) { return it[1]; }).join(' · ') } : null;
+    }
+    var fpsG = [], ftG = [], cpuG = [], memG = [], netG = [], tempG = [];
+    push(fpsG, f.fps, 'FPS ' + f.fps);
+    if (f.jank_rate != null) push(fpsG, f.jank_rate * 100, 'Jank ' + (f.jank_rate * 100).toFixed(1) + '%');
+    push(ftG, f.frame_p50_ms, 'P50 ' + f.frame_p50_ms + 'ms');
+    push(ftG, f.frame_p95_ms, 'P95 ' + f.frame_p95_ms + 'ms');
+    push(ftG, f.frame_max_ms, 'Max ' + f.frame_max_ms + 'ms');
+    push(cpuG, c.cpu_total_pct, 'CPU总 ' + c.cpu_total_pct + '%');
+    push(cpuG, c.cpu_proc_pct, 'CPU进程 ' + c.cpu_proc_pct + '%');
+    if (_cores && c.cpu_proc_pct != null) push(cpuG, c.cpu_proc_pct / _cores, '占整机 ' + (c.cpu_proc_pct / _cores).toFixed(1) + '%');
+    if (m.pss_kb != null) push(memG, m.pss_kb / 1024, 'PSS ' + (m.pss_kb / 1024).toFixed(1) + 'MB');
+    if (m.vmrss_kb != null) push(memG, m.vmrss_kb / 1024, 'RSS ' + (m.vmrss_kb / 1024).toFixed(1) + 'MB');
+    push(netG, n.rx_kbps, '↓' + n.rx_kbps + 'KB/s');
+    push(netG, n.tx_kbps, '↑' + n.tx_kbps + 'KB/s');
+    push(tempG, th.temp_c, th.temp_c + '°C');
+    push(tempG, th.voltage_v, th.voltage_v + 'V');
+
+    var groups = [group('FPS', fpsG), group('帧时间', ftG), group('CPU', cpuG),
+                  group('内存', memG), group('网络', netG), group('温度', tempG)]
+                 .filter(Boolean);
+    if (!groups.length) return null;
     var t = row.t_ms != null ? (row.t_ms / 1000).toFixed(1) + 's' : '';
-    return { t: t, text: items.map(function (it) { return it[1]; }).join(' · ') };
+    return { t: t, groups: groups, text: groups.map(function (g) { return g.text; }).join(' · ') };
   }
   function _pinShowData(idx, localX) {
     var row = _pinRows[idx];

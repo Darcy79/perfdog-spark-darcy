@@ -313,20 +313,32 @@ footer a { color: #4fc3f7; text-decoration: none; }
 .dev-info-label { color: #78909c; }
 .dev-info-value { color: #90a4ae; }
 
-/* v52（需求 B）：锁定时刻全指标快照条（report-meta 下方、汇总卡上方）——
-   深色细边框、中性配色不抢图表风头，可自然换行。
-   v53（体验优化）：加淡入/淡出动效——常态 opacity:0 上移 4px 不可点，锁定加 .show
-   过渡到 opacity:1 归位；隐藏由 JS 先移 .show 过渡回透明，再 display:none 收拢。 */
+/* v52（需求 B）：锁定时刻全指标快照条（report-meta 下方、汇总卡上方）。
+   v53（体验优化）：淡入/淡出。
+   v54（动效换方案 + 分行可读性）：
+     - 动效改"高度展开/收起 + 淡入淡出"复合——常态 max-height:0 + opacity:0 + overflow:hidden
+       完全收拢（消除 v53 透明占位留下的 ~20px 空隙），锁定加 .show 过渡到 max-height 320px
+       （足够容纳 6 行）+ opacity:1；隐藏移 .show 反向收回。显示 .22s ease-out / 隐藏 .2s ease-in。
+     - 内容按模块分组多行（.pin-snapshot-row），模块名浅灰小标签，指标文本中性浅色。 */
 .pin-snapshot {
   display: block;
-  margin-bottom: 10px; padding: 6px 10px;
+  margin-bottom: 0; padding: 0 10px;
   background: rgba(22, 33, 44, 0.5); border: 1px solid #263545; border-radius: 6px;
   font-size: 12px; line-height: 1.6; overflow-wrap: break-word;
-  opacity: 0; transform: translateY(-4px); pointer-events: none;
-  transition: opacity .18s ease, transform .18s ease;
+  max-height: 0; overflow: hidden; opacity: 0; pointer-events: none;
+  border-color: transparent;   /* 收拢时边框透明，避免残留 1px 边线 */
+  /* 显隐过渡：显示 ease-out（先快后慢更自然），隐藏同套（高度收回 + 淡出） */
+  transition: max-height .22s ease-out, opacity .18s ease, padding .22s ease-out,
+              margin-bottom .22s ease-out, border-color .22s ease-out;
 }
-.pin-snapshot.show { opacity: 1; transform: translateY(0); }
-.pin-snapshot-label { color: #4fc3f7; font-weight: 600; }
+.pin-snapshot.show {
+  max-height: 320px; opacity: 1; pointer-events: auto;
+  padding: 6px 10px; margin-bottom: 10px;
+  border-color: #263545;
+}
+.pin-snapshot-label { color: #4fc3f7; font-weight: 600; margin-bottom: 2px; }
+.pin-snapshot-row { display: flex; flex-wrap: wrap; column-gap: 8px; align-items: baseline; }
+.pin-snapshot-name { color: #78909c; font-size: 11px; flex: 0 0 auto; }
 .pin-snapshot-text { color: #cfd8dc; }
 
 /* v49（需求 C）：双报告对比轻量面板 */

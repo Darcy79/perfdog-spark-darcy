@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=53">
+<link rel="stylesheet" href="/assets/style.css?v=54">
 </head>
 <body>
 <header>
@@ -37,7 +37,7 @@
     <div id="report-body" style="display:none">
       <div class="report-meta" id="report-meta"></div>
       <!-- v52（需求 B）：锁定时刻全指标快照条（report-meta 下方、汇总卡上方），解锁/切报告隐藏。
-           v53（体验优化）：显隐改 CSS opacity+transform 过渡，display 由 JS 在淡出后收拢 -->
+           v54（体验优化）：max-height 展开/收起 + 淡入淡出，按模块分组多行 -->
       <div id="pin-snapshot" class="pin-snapshot"></div>
       <!-- v48（UI优化 1.4/3.5）：提示行收敛为短提示 + "?" 操作卡（含 legend 选数据、虚线=日志事件说明） -->
       <div class="drag-hint" style="position:relative">
@@ -88,8 +88,8 @@
 <!-- v48（UI优化 3.4）：深色 toast 浮层（替代失败类 alert） -->
 <div class="pd-toast" id="pd-toast"></div>
 
-<script src="/assets/echarts.min.js?v=53"></script>
-<script src="/assets/app.js?v=53"></script>
+<script src="/assets/echarts.min.js?v=54"></script>
+<script src="/assets/app.js?v=54"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -623,9 +623,9 @@
 
   // v52（需求 B）：注册锁定/解锁快照钩子——由 app.js 在锁定/解锁同一处驱动，
   // 保证顶部快照条与蓝线锁定状态严格同步；解锁/切报告传 null 即隐藏。
-  // v53（体验优化）：显隐加淡入/淡出——显示先 display:block 置透明→rAF 加 .show 过渡；
-  // 隐藏先移 .show 过渡回透明→setTimeout 后 display:none 收拢。单一 hideTimer 防竞态
-  // （连续锁定-解锁-锁定时，隐藏的定时器被新显示清除，不会误杀刚显示的状态）。
+  // v53→v54（体验优化）：v54 改"高度展开/收起 + 淡入淡出"复合动效，并按模块分组多行。
+  // 显示=清 hideTimer→填多行内容→reflow→rAF 加 .show（max-height 0→320px + opacity 0→1 过渡）；
+  // 隐藏=移 .show 过渡收回→setTimeout(230ms) 后清空内容。单一 hideTimer 防竞态。
   (function () {
     var hideTimer = null;
     window.PerfCharts.setPinHook(function (snapshot) {
@@ -635,27 +635,35 @@
       if (!snapshot) {
         if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
         bar.classList.remove('show');
-        // 过渡到透明后再收拢，避免 display:none 打断淡出
         hideTimer = setTimeout(function () {
           hideTimer = null;
-          if (!bar.classList.contains('show')) { bar.style.display = 'none'; bar.textContent = ''; }
-        }, 200);
+          if (!bar.classList.contains('show')) bar.textContent = '';   // 收拢后清内容（不残留文本）
+        }, 230);
         return;
       }
 
-      // 显示：清掉待隐藏定时器，先确保 display 且无 .show（透明），再 rAF 触发过渡
       if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
       bar.classList.remove('show');
-      bar.style.display = 'block';
-      var label = document.createElement('span');
+      // 头部：📌 T=xx.x s
+      var label = document.createElement('div');
       label.className = 'pin-snapshot-label';
-      label.textContent = '📌 T=' + snapshot.t + ' ';
-      var text = document.createElement('span');
-      text.className = 'pin-snapshot-text';
-      text.textContent = snapshot.text;   // textContent 免疫注入
+      label.textContent = '📌 T=' + snapshot.t;
       bar.textContent = '';
       bar.appendChild(label);
-      bar.appendChild(text);
+      // 分组多行：每行 [模块名标签][指标文本]，全部 textContent 免疫注入
+      (snapshot.groups || []).forEach(function (g) {
+        var row = document.createElement('div');
+        row.className = 'pin-snapshot-row';
+        var nm = document.createElement('span');
+        nm.className = 'pin-snapshot-name';
+        nm.textContent = g.name;
+        var tx = document.createElement('span');
+        tx.className = 'pin-snapshot-text';
+        tx.textContent = g.text;
+        row.appendChild(nm);
+        row.appendChild(tx);
+        bar.appendChild(row);
+      });
       // 强制 reflow 后再加 .show，保证 transition 一定触发
       void bar.offsetWidth;
       requestAnimationFrame(function () { bar.classList.add('show'); });
