@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=51">
+<link rel="stylesheet" href="/assets/style.css?v=52">
 </head>
 <body>
 <header>
@@ -36,6 +36,8 @@
     <div id="compare-panel" class="compare-panel" style="display:none"></div>
     <div id="report-body" style="display:none">
       <div class="report-meta" id="report-meta"></div>
+      <!-- v52（需求 B）：锁定时刻全指标快照条（report-meta 下方、汇总卡上方），解锁/切报告隐藏 -->
+      <div id="pin-snapshot" class="pin-snapshot" style="display:none"></div>
       <!-- v48（UI优化 1.4/3.5）：提示行收敛为短提示 + "?" 操作卡（含 legend 选数据、虚线=日志事件说明） -->
       <div class="drag-hint" style="position:relative">
         <span>悬停贯穿 · 点击锁定 · "?" 看全部操作</span>
@@ -85,8 +87,8 @@
 <!-- v48（UI优化 3.4）：深色 toast 浮层（替代失败类 alert） -->
 <div class="pd-toast" id="pd-toast"></div>
 
-<script src="/assets/echarts.min.js?v=51"></script>
-<script src="/assets/app.js?v=51"></script>
+<script src="/assets/echarts.min.js?v=52"></script>
+<script src="/assets/app.js?v=52"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -214,7 +216,7 @@
       renameBtn.textContent = '✎';
       renameBtn.onclick = function (e) {
         e.stopPropagation();
-        renameRun(run.name, run.remark);
+        startInlineRename(run.name, run.remark, title, renameBtn);   // v52：内联编辑
       };
       nameRow.appendChild(renameBtn);
       // v49（需求 C）：对比选择入口——☑ 图标，stopPropagation 避免触发 selectRun
@@ -237,19 +239,55 @@
     });
   }
 
-  function renameRun(name, current) {
-    var def = current || name.replace(/^.*\//, '').replace(/\.jsonl$/, '');
-    var newname = window.prompt('备注/重命名该次测试（填写测试场景，如：修甲-弱网-第一次）：', def);
-    if (newname === null) return;   // 取消
-    if (newname === def) return;
-    fetch('/api/rename?name=' + encodeURIComponent(name) +
-          '&newname=' + encodeURIComponent(newname), { method: 'POST' })
-      .then(function (r) { return r.json(); })
-      .then(function (res) {
-        if (res && res.ok) loadRuns();
-        else toast('重命名失败: ' + (res && res.error || '未知错误'), 'err');   // v48（3.4）
-      })
-      .catch(function () { toast('重命名失败', 'err'); });   // v48（3.4）
+  // v52（需求 A）：重命名内联化——✎ 点后标题原地变输入框，不再弹原生 prompt。
+  // 回车=提交（走原 /api/rename）、Esc/blur=取消恢复原样；编辑中隐藏 ✎ 防重复触发。
+  function renameDefault(name, current) {
+    return current || name.replace(/^.*\//, '').replace(/\.jsonl$/, '');
+  }
+
+  function startInlineRename(name, current, titleSpan, renameBtn) {
+    if (!titleSpan || titleSpan.parentNode === null) return;
+    var input = document.createElement('input');
+    input.className = 'run-rename-input';
+    input.type = 'text';
+    input.value = renameDefault(name, current);   // value 用 DOM property 赋值（安全）
+    input.spellcheck = false;
+    var committing = false;   // 提交中置位，避免提交触发 blur 时误取消
+
+    // 编辑中隐藏 ✎（防再触发）；☑/📄 保留可点但各自 stopPropagation 不受影响
+    renameBtn.style.display = 'none';
+
+    function cancel() {
+      renameBtn.style.display = '';
+      if (input.parentNode) input.parentNode.replaceChild(titleSpan, input);
+    }
+    function submit() {
+      if (committing) return;
+      var newname = input.value.trim();
+      if (!newname || newname === renameDefault(name, current)) { cancel(); return; }
+      committing = true;
+      fetch('/api/rename?name=' + encodeURIComponent(name) +
+            '&newname=' + encodeURIComponent(newname), { method: 'POST' })
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+          if (res && res.ok) { loadRuns(); return; }   // 成功后重建列表（标题/备注同步）
+          toast('重命名失败: ' + (res && res.error || '未知错误'), 'err');
+          cancel();
+        })
+        .catch(function () { toast('重命名失败', 'err'); cancel(); });
+    }
+
+    input.addEventListener('keydown', function (e) {
+      e.stopPropagation();
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+      else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    });
+    input.addEventListener('blur', function () { if (!committing) cancel(); });
+    input.addEventListener('click', function (e) { e.stopPropagation(); });   // 不触发 selectRun
+
+    titleSpan.parentNode.replaceChild(input, titleSpan);
+    input.focus();
+    input.select();   // 全选，方便直接覆盖
   }
 
   function selectRun(name) {
@@ -581,6 +619,25 @@
   })();
 
   window.PerfCharts.initSortable('#report-body');
+
+  // v52（需求 B）：注册锁定/解锁快照钩子——由 app.js 在锁定/解锁同一处驱动，
+  // 保证顶部快照条与蓝线锁定状态严格同步；解锁/切报告传 null 即隐藏。
+  window.PerfCharts.setPinHook(function (snapshot) {
+    var bar = document.getElementById('pin-snapshot');
+    if (!bar) return;   // index.html 无该容器，天然无行为
+    if (!snapshot) { bar.style.display = 'none'; bar.textContent = ''; return; }
+    var label = document.createElement('span');
+    label.className = 'pin-snapshot-label';
+    label.textContent = '📌 T=' + snapshot.t + ' ';
+    var text = document.createElement('span');
+    text.className = 'pin-snapshot-text';
+    text.textContent = snapshot.text;   // textContent 免疫注入
+    bar.textContent = '';
+    bar.appendChild(label);
+    bar.appendChild(text);
+    bar.style.display = 'block';
+  });
+
   loadRuns();
   setInterval(loadRuns, 5000);
 

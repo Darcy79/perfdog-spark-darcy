@@ -233,6 +233,13 @@ footer a { color: #4fc3f7; text-decoration: none; }
 .run-item:hover { background: #1c2a38; }
 .run-item.active { background: #22374a; border-color: #4fc3f7; }
 .run-name { font-size: 13px; color: #cfd8dc; word-break: break-all; display: flex; align-items: center; }
+/* v52（需求 A）：重命名内联输入框——沿用 .filter-input 观感，占满标题可用宽度 */
+.run-rename-input {
+  flex: 1 1 auto; min-width: 0;
+  background: #1a2530; border: 1px solid #4fc3f7; border-radius: 5px;
+  color: #cfd8dc; font-size: 13px; font-family: inherit;
+  padding: 2px 6px; outline: none; line-height: 1.5;
+}
 .rename-btn {
   color: #4fc3f7; cursor: pointer; font-size: 12px; margin-left: 6px;
   opacity: 0.55; flex: 0 0 auto; user-select: none;
@@ -305,6 +312,16 @@ footer a { color: #4fc3f7; text-decoration: none; }
 .dev-info { margin-top: 6px; font-size: 12px; line-height: 1.7; }
 .dev-info-label { color: #78909c; }
 .dev-info-value { color: #90a4ae; }
+
+/* v52（需求 B）：锁定时刻全指标快照条（report-meta 下方、汇总卡上方）——
+   深色细边框、中性配色不抢图表风头，可自然换行 */
+.pin-snapshot {
+  margin-bottom: 10px; padding: 6px 10px;
+  background: rgba(22, 33, 44, 0.5); border: 1px solid #263545; border-radius: 6px;
+  font-size: 12px; line-height: 1.6; overflow-wrap: break-word;
+}
+.pin-snapshot-label { color: #4fc3f7; font-weight: 600; }
+.pin-snapshot-text { color: #cfd8dc; }
 
 /* v49（需求 C）：双报告对比轻量面板 */
 .compare-panel {

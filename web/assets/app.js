@@ -238,6 +238,7 @@
       }
     });
     _pinShowData(idx, localX);   // 蓝线位置显示该模块 tooltip 风格数据浮层
+    _pinNotify(_buildPinSnapshot(_pinRows[idx]));   // v52（需求 B）：锁定 → 通知快照条显示
   }
 
   // 锁定时刻各模块数据浮层（仿 tooltip 样式，DOM 实现，独立于 ECharts tooltip 不与白线冲突）
@@ -281,6 +282,41 @@
     ]); },
   };
   function setPinData(rows) { _pinRows = rows || []; }
+
+  // v52（需求 B）：锁定时刻全指标快照条——挂一个可空钩子，锁定/解锁时由 app.js
+  // 在**同一处**通知外部（report.html 注册）。锁定传快照对象、解锁传 null。
+  // 这样 report.html 顶部快照条与蓝线锁定状态严格同步，不存在两处逻辑分叉。
+  var _pinHook = null;
+  function setPinHook(fn) { _pinHook = (typeof fn === 'function') ? fn : null; }
+  function _pinNotify(snapshot) { if (_pinHook) { try { _pinHook(snapshot); } catch (e) {} } }
+
+  // 拼锁定时刻的全指标快照文本（口径与 _PIN_FIELDS 完全同源，各图字段合并成一行流）。
+  // 返回 { t: '12.3s', text: 'FPS 59.9 · Jank 3.0% · P95 16.8ms · ...' }；无行数据返回 null。
+  function _buildPinSnapshot(row) {
+    if (!row) return null;
+    var f = row.fps || {}, c = row.cpu || {}, m = row.mem || {}, n = row.net || {}, th = row.therm || {};
+    // 每项 [数值, 文本]；数值仅用于排序（与 _pinSortParts 同口径），null 项过滤
+    var items = [];
+    function push(v, text) { if (v != null && isFinite(v)) items.push([v, text]); }
+    push(f.fps, 'FPS ' + f.fps);
+    if (f.jank_rate != null) push(f.jank_rate * 100, 'Jank ' + (f.jank_rate * 100).toFixed(1) + '%');
+    push(f.frame_p50_ms, 'P50 ' + f.frame_p50_ms + 'ms');
+    push(f.frame_p95_ms, 'P95 ' + f.frame_p95_ms + 'ms');
+    push(f.frame_max_ms, 'Max ' + f.frame_max_ms + 'ms');
+    push(c.cpu_total_pct, 'CPU总 ' + c.cpu_total_pct + '%');
+    push(c.cpu_proc_pct, 'CPU进程 ' + c.cpu_proc_pct + '%');
+    if (_cores && c.cpu_proc_pct != null) push(c.cpu_proc_pct / _cores, '占整机 ' + (c.cpu_proc_pct / _cores).toFixed(1) + '%');
+    if (m.pss_kb != null) push(m.pss_kb / 1024, 'PSS ' + (m.pss_kb / 1024).toFixed(1) + 'MB');
+    if (m.vmrss_kb != null) push(m.vmrss_kb / 1024, 'RSS ' + (m.vmrss_kb / 1024).toFixed(1) + 'MB');
+    push(n.rx_kbps, '↓' + n.rx_kbps + 'KB/s');
+    push(n.tx_kbps, '↑' + n.tx_kbps + 'KB/s');
+    push(th.temp_c, th.temp_c + '°C');
+    push(th.voltage_v, th.voltage_v + 'V');
+    if (!items.length) return null;
+    items.sort(function (a, b) { return b[0] - a[0]; });
+    var t = row.t_ms != null ? (row.t_ms / 1000).toFixed(1) + 's' : '';
+    return { t: t, text: items.map(function (it) { return it[1]; }).join(' · ') };
+  }
   function _pinShowData(idx, localX) {
     var row = _pinRows[idx];
     if (!row) return;
@@ -352,6 +388,7 @@
     document.querySelectorAll('.pin-line').forEach(function (l) { l.style.left = '-9999px'; });
     document.querySelectorAll('.pin-tip').forEach(function (tip) { tip.style.display = 'none'; });
     document.querySelectorAll('.pin-data').forEach(function (pd) { pd.style.display = 'none'; });
+    _pinNotify(null);   // v52（需求 B）：解锁 → 通知快照条隐藏
   }
 
   // ---------------- 自定义时间拖动条（2026-08-14 v28，PerfDog 云端风格） ----------------
@@ -1120,6 +1157,7 @@
     deviceInfoLines: deviceInfoLines,   // 设备信息 → 结构化行数组（历史看板分行渲染）
     formatDeviceInfo: formatDeviceInfo, // 设备信息 → 一行小字（状态栏；基于 deviceInfoLines）
     setPinData: setPinData,
+    setPinHook: setPinHook,   // v52（需求 B）：注册锁定/解锁快照钩子（report.html 用）
     renderAll: renderAll,
     updateStats: updateStats,
     computeStats: computeStats,
