@@ -314,12 +314,18 @@ footer a { color: #4fc3f7; text-decoration: none; }
 .dev-info-value { color: #90a4ae; }
 
 /* v52（需求 B）：锁定时刻全指标快照条（report-meta 下方、汇总卡上方）——
-   深色细边框、中性配色不抢图表风头，可自然换行 */
+   深色细边框、中性配色不抢图表风头，可自然换行。
+   v53（体验优化）：加淡入/淡出动效——常态 opacity:0 上移 4px 不可点，锁定加 .show
+   过渡到 opacity:1 归位；隐藏由 JS 先移 .show 过渡回透明，再 display:none 收拢。 */
 .pin-snapshot {
+  display: block;
   margin-bottom: 10px; padding: 6px 10px;
   background: rgba(22, 33, 44, 0.5); border: 1px solid #263545; border-radius: 6px;
   font-size: 12px; line-height: 1.6; overflow-wrap: break-word;
+  opacity: 0; transform: translateY(-4px); pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease;
 }
+.pin-snapshot.show { opacity: 1; transform: translateY(0); }
 .pin-snapshot-label { color: #4fc3f7; font-weight: 600; }
 .pin-snapshot-text { color: #cfd8dc; }
 

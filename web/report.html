@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=52">
+<link rel="stylesheet" href="/assets/style.css?v=53">
 </head>
 <body>
 <header>
@@ -36,8 +36,9 @@
     <div id="compare-panel" class="compare-panel" style="display:none"></div>
     <div id="report-body" style="display:none">
       <div class="report-meta" id="report-meta"></div>
-      <!-- v52（需求 B）：锁定时刻全指标快照条（report-meta 下方、汇总卡上方），解锁/切报告隐藏 -->
-      <div id="pin-snapshot" class="pin-snapshot" style="display:none"></div>
+      <!-- v52（需求 B）：锁定时刻全指标快照条（report-meta 下方、汇总卡上方），解锁/切报告隐藏。
+           v53（体验优化）：显隐改 CSS opacity+transform 过渡，display 由 JS 在淡出后收拢 -->
+      <div id="pin-snapshot" class="pin-snapshot"></div>
       <!-- v48（UI优化 1.4/3.5）：提示行收敛为短提示 + "?" 操作卡（含 legend 选数据、虚线=日志事件说明） -->
       <div class="drag-hint" style="position:relative">
         <span>悬停贯穿 · 点击锁定 · "?" 看全部操作</span>
@@ -87,8 +88,8 @@
 <!-- v48（UI优化 3.4）：深色 toast 浮层（替代失败类 alert） -->
 <div class="pd-toast" id="pd-toast"></div>
 
-<script src="/assets/echarts.min.js?v=52"></script>
-<script src="/assets/app.js?v=52"></script>
+<script src="/assets/echarts.min.js?v=53"></script>
+<script src="/assets/app.js?v=53"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -622,21 +623,44 @@
 
   // v52（需求 B）：注册锁定/解锁快照钩子——由 app.js 在锁定/解锁同一处驱动，
   // 保证顶部快照条与蓝线锁定状态严格同步；解锁/切报告传 null 即隐藏。
-  window.PerfCharts.setPinHook(function (snapshot) {
-    var bar = document.getElementById('pin-snapshot');
-    if (!bar) return;   // index.html 无该容器，天然无行为
-    if (!snapshot) { bar.style.display = 'none'; bar.textContent = ''; return; }
-    var label = document.createElement('span');
-    label.className = 'pin-snapshot-label';
-    label.textContent = '📌 T=' + snapshot.t + ' ';
-    var text = document.createElement('span');
-    text.className = 'pin-snapshot-text';
-    text.textContent = snapshot.text;   // textContent 免疫注入
-    bar.textContent = '';
-    bar.appendChild(label);
-    bar.appendChild(text);
-    bar.style.display = 'block';
-  });
+  // v53（体验优化）：显隐加淡入/淡出——显示先 display:block 置透明→rAF 加 .show 过渡；
+  // 隐藏先移 .show 过渡回透明→setTimeout 后 display:none 收拢。单一 hideTimer 防竞态
+  // （连续锁定-解锁-锁定时，隐藏的定时器被新显示清除，不会误杀刚显示的状态）。
+  (function () {
+    var hideTimer = null;
+    window.PerfCharts.setPinHook(function (snapshot) {
+      var bar = document.getElementById('pin-snapshot');
+      if (!bar) return;   // index.html 无该容器，天然无行为
+
+      if (!snapshot) {
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+        bar.classList.remove('show');
+        // 过渡到透明后再收拢，避免 display:none 打断淡出
+        hideTimer = setTimeout(function () {
+          hideTimer = null;
+          if (!bar.classList.contains('show')) { bar.style.display = 'none'; bar.textContent = ''; }
+        }, 200);
+        return;
+      }
+
+      // 显示：清掉待隐藏定时器，先确保 display 且无 .show（透明），再 rAF 触发过渡
+      if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      bar.classList.remove('show');
+      bar.style.display = 'block';
+      var label = document.createElement('span');
+      label.className = 'pin-snapshot-label';
+      label.textContent = '📌 T=' + snapshot.t + ' ';
+      var text = document.createElement('span');
+      text.className = 'pin-snapshot-text';
+      text.textContent = snapshot.text;   // textContent 免疫注入
+      bar.textContent = '';
+      bar.appendChild(label);
+      bar.appendChild(text);
+      // 强制 reflow 后再加 .show，保证 transition 一定触发
+      void bar.offsetWidth;
+      requestAnimationFrame(function () { bar.classList.add('show'); });
+    });
+  })();
 
   loadRuns();
   setInterval(loadRuns, 5000);
