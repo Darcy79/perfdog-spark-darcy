@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=54">
+<link rel="stylesheet" href="/assets/style.css?v=55">
 </head>
 <body>
 <header>
@@ -88,8 +88,8 @@
 <!-- v48（UI优化 3.4）：深色 toast 浮层（替代失败类 alert） -->
 <div class="pd-toast" id="pd-toast"></div>
 
-<script src="/assets/echarts.min.js?v=54"></script>
-<script src="/assets/app.js?v=54"></script>
+<script src="/assets/echarts.min.js?v=55"></script>
+<script src="/assets/app.js?v=55"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -624,16 +624,26 @@
   // v52（需求 B）：注册锁定/解锁快照钩子——由 app.js 在锁定/解锁同一处驱动，
   // 保证顶部快照条与蓝线锁定状态严格同步；解锁/切报告传 null 即隐藏。
   // v53→v54（体验优化）：v54 改"高度展开/收起 + 淡入淡出"复合动效，并按模块分组多行。
-  // 显示=清 hideTimer→填多行内容→reflow→rAF 加 .show（max-height 0→320px + opacity 0→1 过渡）；
-  // 隐藏=移 .show 过渡收回→setTimeout(230ms) 后清空内容。单一 hideTimer 防竞态。
+  // v55（冻结窗格）：锁定期间把快照条高度写入 #report-body 的 --snap-h，让 slider 的
+  //   sticky top 让位到快照条下方（见 .global-slider-wrap top:var(--snap-h)），实现
+  //   快照条贴顶冻结 + slider 到顶时纵排接力，不重叠互遮。展开动画结束后测高，隐藏即时归 0。
   (function () {
     var hideTimer = null;
+    var snapTimer = null;   // 展开后测高定时器（与 hideTimer 分离，防相互误清）
+    var body = document.getElementById('report-body');
+
+    function setSnapH(px) {
+      if (body) body.style.setProperty('--snap-h', px + 'px');
+    }
+
     window.PerfCharts.setPinHook(function (snapshot) {
       var bar = document.getElementById('pin-snapshot');
       if (!bar) return;   // index.html 无该容器，天然无行为
 
       if (!snapshot) {
         if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+        if (snapTimer) { clearTimeout(snapTimer); snapTimer = null; }
+        setSnapH(0);   // 解锁：slider 立即回到顶（快照条正在收起，短暂被 slider 盖住无碍）
         bar.classList.remove('show');
         hideTimer = setTimeout(function () {
           hideTimer = null;
@@ -643,6 +653,7 @@
       }
 
       if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      if (snapTimer) { clearTimeout(snapTimer); snapTimer = null; }
       bar.classList.remove('show');
       // 头部：📌 T=xx.x s
       var label = document.createElement('div');
@@ -667,6 +678,11 @@
       // 强制 reflow 后再加 .show，保证 transition 一定触发
       void bar.offsetWidth;
       requestAnimationFrame(function () { bar.classList.add('show'); });
+      // 展开动画（max-height .22s）结束后测实际高度，写入 --snap-h 供 slider 让位
+      snapTimer = setTimeout(function () {
+        snapTimer = null;
+        if (bar.classList.contains('show')) setSnapH(bar.offsetHeight);
+      }, 260);
     });
   })();
 

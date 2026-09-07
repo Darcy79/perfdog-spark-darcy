@@ -137,7 +137,10 @@ main { flex: 1; padding: 16px 20px; display: flex; flex-direction: column; gap: 
    替代原来 6 图各挂一条（功能全联动本就共享 _dz，只是挂点减 1）。
    条比图下版更高更好抓，且粘性跟随滚动随时可拖。 */
 .global-slider-wrap {
-  position: sticky; top: 0; z-index: 15; margin-bottom: 12px;
+  /* v55（冻结窗格）：top 改 CSS 变量——锁定快照条展开后 JS 把其高度写入 --snap-h，
+     让 slider 滚到顶时停在快照条下方纵排，避免两者同时 sticky top:0 重叠互遮。
+     未锁定 --snap-h=0 → 行为与之前完全一致。 */
+  position: sticky; top: var(--snap-h, 0px); z-index: 15; margin-bottom: 12px;
   background: rgba(16, 21, 28, .92); backdrop-filter: blur(4px);
   padding: 8px 12px 6px; border: 1px solid #263545; border-radius: 8px;
 }
@@ -327,6 +330,10 @@ footer a { color: #4fc3f7; text-decoration: none; }
   font-size: 12px; line-height: 1.6; overflow-wrap: break-word;
   max-height: 0; overflow: hidden; opacity: 0; pointer-events: none;
   border-color: transparent;   /* 收拢时边框透明，避免残留 1px 边线 */
+  /* v55（冻结窗格）：锁定期间贴顶冻结（Excel 冻结首行效果）——
+     sticky top:0 + z-index 高于图表卡与 slider(15)，滚动看下方图表时始终可见。
+     背景在 .show 态接近不透明防内容透出。 */
+  position: sticky; top: 0; z-index: 16;
   /* 显隐过渡：显示 ease-out（先快后慢更自然），隐藏同套（高度收回 + 淡出） */
   transition: max-height .22s ease-out, opacity .18s ease, padding .22s ease-out,
               margin-bottom .22s ease-out, border-color .22s ease-out;
@@ -335,6 +342,8 @@ footer a { color: #4fc3f7; text-decoration: none; }
   max-height: 320px; opacity: 1; pointer-events: auto;
   padding: 6px 10px; margin-bottom: 10px;
   border-color: #263545;
+  background: rgba(22, 33, 44, 0.95);   /* 冻结贴顶时近乎不透明，防下方内容透出 */
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);   /* 极淡阴影与页面区分 */
 }
 .pin-snapshot-label { color: #4fc3f7; font-weight: 600; margin-bottom: 2px; }
 .pin-snapshot-row { display: flex; flex-wrap: wrap; column-gap: 8px; align-items: baseline; }
