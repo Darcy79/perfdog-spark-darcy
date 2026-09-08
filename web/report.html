@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=55">
+<link rel="stylesheet" href="/assets/style.css?v=56">
 </head>
 <body>
 <header>
@@ -88,8 +88,8 @@
 <!-- v48（UI优化 3.4）：深色 toast 浮层（替代失败类 alert） -->
 <div class="pd-toast" id="pd-toast"></div>
 
-<script src="/assets/echarts.min.js?v=55"></script>
-<script src="/assets/app.js?v=55"></script>
+<script src="/assets/echarts.min.js?v=56"></script>
+<script src="/assets/app.js?v=56"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -300,6 +300,11 @@
     // fetch + 渲染全部完成后一次性显示新报告（无覆盖层、无叠加、无位置漂移）。
     // 连续快速切换时用 loadingSeq 丢弃慢响应，避免旧数据覆盖新报告。
     var seq = ++loadingSeq;
+    // v56（出入动效）：切报告前清掉时间条 .slider-show（状态归位）。report-body 随父
+    // 整体瞬隐（含 meta/汇总/图表，属既有"加载完再显示"切换态），时间条单独淡出会与
+    // 其余内容瞬隐不一致，故只做状态清理、不拖慢切换；新报告加载后时间条重新淡入。
+    var gsPrev = document.getElementById('global-slider-wrap');
+    if (gsPrev) gsPrev.classList.remove('slider-show');
     document.getElementById('report-body').style.display = 'none';
     setPlaceholder(PH_LOADING, true);
     fetch('/api/report?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); })
@@ -409,10 +414,15 @@
         window.PerfCharts.clearPin();   // 切换报告时清除上一份的锁定贯穿线
         window.PerfCharts.setPinData(dataRows); // 供点击锁定显示各模块时刻数据
         // v48（UI优化 3.1）：全局单时间条（挂在汇总卡上方，控制全部图表缩放）
+        // v56（出入动效）：淡入——先 display:block 置透明（无 .slider-show），reflow 后
+        // rAF 加 .slider-show 过渡到可见，避免 display 直切闪现。
         var gsWrap = document.getElementById('global-slider-wrap');
         window.PerfCharts.clearTimeSliders();           // 重建前清旧拖动条
+        gsWrap.classList.remove('slider-show');
         gsWrap.style.display = 'block';
         window.PerfCharts.createTimeSliders(charts, dataRows, gsWrap);
+        void gsWrap.offsetWidth;   // 强制 reflow 保证过渡触发
+        requestAnimationFrame(function () { gsWrap.classList.add('slider-show'); });
         // 模式1：加载 logcat 事件标注层（场景/console 事件叠加到曲线）
         fetch('/api/events?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); })
           .then(function (events) {

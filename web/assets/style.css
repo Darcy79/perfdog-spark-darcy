@@ -139,11 +139,17 @@ main { flex: 1; padding: 16px 20px; display: flex; flex-direction: column; gap: 
 .global-slider-wrap {
   /* v55（冻结窗格）：top 改 CSS 变量——锁定快照条展开后 JS 把其高度写入 --snap-h，
      让 slider 滚到顶时停在快照条下方纵排，避免两者同时 sticky top:0 重叠互遮。
-     未锁定 --snap-h=0 → 行为与之前完全一致。 */
+     未锁定 --snap-h=0 → 行为与之前完全一致。
+     v56（出入动效）：淡入淡出 + top 过渡——显示加 .slider-show 由 opacity:0/微上移过渡到
+     可见；top 加 transition 让锁定/解锁时 --snap-h 变化（时间条在快照条下方让位）平滑位移，
+     不再瞬间下跳/上跳，与快照条动效观感一致。 */
   position: sticky; top: var(--snap-h, 0px); z-index: 15; margin-bottom: 12px;
   background: rgba(16, 21, 28, .92); backdrop-filter: blur(4px);
   padding: 8px 12px 6px; border: 1px solid #263545; border-radius: 8px;
+  opacity: 0; transform: translateY(-3px); pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease, top .22s ease-out;
 }
+.global-slider-wrap.slider-show { opacity: 1; transform: translateY(0); pointer-events: auto; }
 .global-slider-wrap .pd-slider { height: 22px; }
 /* 点击锁定后标题行右侧的数据卡（V22 效果，与蓝线旁浮层并存） */
 .pin-data {
