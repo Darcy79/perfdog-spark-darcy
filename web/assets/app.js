@@ -137,8 +137,14 @@
             if (g && isFinite(g[0]) && isFinite(g[1])) { xs.push(g[0]); ys.push(g[1]); }
           });
         if (!xs.length) return false;
-        gx = Math.min.apply(null, xs); gy = Math.min.apply(null, ys);
-        gw = Math.max.apply(null, xs) - gx; gh = Math.max.apply(null, ys) - gy;
+        // 循环归约取极值（不用 Math.min/max.apply：大数组展开参数会抛 RangeError）
+        var xMin = xs[0], xMax = xs[0], yMin = ys[0], yMax = ys[0];
+        for (var i = 1; i < xs.length; i++) {
+          if (xs[i] < xMin) xMin = xs[i]; if (xs[i] > xMax) xMax = xs[i];
+          if (ys[i] < yMin) yMin = ys[i]; if (ys[i] > yMax) yMax = ys[i];
+        }
+        gx = xMin; gy = yMin;
+        gw = xMax - gx; gh = yMax - gy;
       } else {
         // 常见情形：legend 仅平移（位置在 group.x/y，无 transform 矩阵）→ 直接相加
         gx = group.x + rect.x; gy = group.y + rect.y;
@@ -550,8 +556,12 @@
         if (typeof v === 'number' && isFinite(v)) vals.push(v);
       }
       if (!vals.length) return;
-      var lo = Math.min.apply(null, vals);
-      var hi = Math.max.apply(null, vals);
+      // 循环归约取极值（长报告 vals 可达数十万点，apply 展开会抛 RangeError）
+      var lo = vals[0], hi = vals[0];
+      for (var k = 1; k < vals.length; k++) {
+        if (vals[k] < lo) lo = vals[k];
+        if (vals[k] > hi) hi = vals[k];
+      }
       var span = hi - lo || 1;
       ctx.beginPath();
       var first = true;
@@ -621,8 +631,22 @@
   }
 
   function avg(arr) { var a = clean(arr); return a.length ? a.reduce(function (s, v) { return s + v; }, 0) / a.length : null; }
-  function min(arr) { var a = clean(arr); return a.length ? Math.min.apply(null, a) : null; }
-  function max(arr) { var a = clean(arr); return a.length ? Math.max.apply(null, a) : null; }
+  // 极值用循环归约（不用 Math.min/max.apply：长报告数十万点时参数展开抛
+  // RangeError: Maximum call stack size exceeded，导致统计栏整体崩溃）
+  function min(arr) {
+    var a = clean(arr);
+    if (!a.length) return null;
+    var m = a[0];
+    for (var i = 1; i < a.length; i++) { if (a[i] < m) m = a[i]; }
+    return m;
+  }
+  function max(arr) {
+    var a = clean(arr);
+    if (!a.length) return null;
+    var m = a[0];
+    for (var i = 1; i < a.length; i++) { if (a[i] > m) m = a[i]; }
+    return m;
+  }
   function p95(arr) {
     var a = clean(arr).slice().sort(function (x, y) { return x - y; });
     if (!a.length) return null;

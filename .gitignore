@@ -16,6 +16,9 @@ collector/output/
 build/
 dist/
 *.spec
+# 例外：根目录 perfdog.spec 是手工维护的打包配置（CI build.yml 依赖），
+# 其余 .spec 仍是本机构建产物
+!/perfdog.spec
 packaging/staging/
 # Inno Setup 安装包产物
 packaging/installer_output/

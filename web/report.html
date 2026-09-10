@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=56">
+<link rel="stylesheet" href="/assets/style.css?v=57">
 </head>
 <body>
 <header>
@@ -88,8 +88,8 @@
 <!-- v48（UI优化 3.4）：深色 toast 浮层（替代失败类 alert） -->
 <div class="pd-toast" id="pd-toast"></div>
 
-<script src="/assets/echarts.min.js?v=56"></script>
-<script src="/assets/app.js?v=56"></script>
+<script src="/assets/echarts.min.js?v=57"></script>
+<script src="/assets/app.js?v=57"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -426,6 +426,7 @@
         // 模式1：加载 logcat 事件标注层（场景/console 事件叠加到曲线）
         fetch('/api/events?name=' + encodeURIComponent(name)).then(function (r) { return r.json(); })
           .then(function (events) {
+            if (seq !== loadingSeq) return;   // 已有更新的加载，丢弃慢响应（与主 fetch 同款守卫）
             if (Array.isArray(events) && events.length) {
               window.PerfCharts.renderEvents(charts, dataRows, events);
             }
