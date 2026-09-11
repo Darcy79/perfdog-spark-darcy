@@ -47,6 +47,27 @@ def load_config(path):
         return json.load(f)
 
 
+# 断连/半死退避参数（v61）：连续失败 streak 达到 FAIL_ALERT_STREAK 即告警；
+# 此后主循环 sleep 按 streak 递增（上限 BACKOFF_MAX_S），避免 adb 每次 shell
+# 阻塞到 timeout（20s）时仍按 1s 节奏空转猛撞超时、把告警拖到最坏 3 分钟。
+FAIL_ALERT_STREAK = 3
+BACKOFF_MAX_S = 5.0
+
+
+def backoff_sleep(base_iv, fail_streak):
+    """按连续失败轮数计算本轮 sleep 秒数（纯函数便于单测）。
+
+    fail_streak < FAIL_ALERT_STREAK：正常节奏 base_iv（下限 0.05s）；
+    达到阈值后线性退避 base_iv × streak，封顶 BACKOFF_MAX_S。
+    设备恢复（streak 清零）后立即回到正常节奏。
+    """
+    base = max(0.05, float(base_iv or 0.05))
+    streak = int(fail_streak or 0)
+    if streak < FAIL_ALERT_STREAK:
+        return base
+    return min(base * streak, BACKOFF_MAX_S)
+
+
 def main():
     ap = argparse.ArgumentParser(description="自研 PerfDog 采集器（第一阶段：FPS/CPU/内存）")
     ap.add_argument("--config", default="config.json", help="配置文件路径")
@@ -325,7 +346,7 @@ def main():
                             if isinstance(row.get(k), dict) and row[k].get("error"))
             if err_count >= len(SAMPLER_INTERVALS) - 1:
                 fail_streak += 1
-                if fail_streak >= 10 and not diag_shown:
+                if fail_streak >= FAIL_ALERT_STREAK and not diag_shown:
                     diag_shown = True
                     if adb.is_device_alive():
                         print("[!] 连续采样失败但设备在线：请确认目标应用在前台/渲染层存在", flush=True)
@@ -386,7 +407,9 @@ def main():
                 f"CPU总%={cpu_v.get('cpu_total_pct', '-')} CPU进程%={cpu_v.get('cpu_proc_pct', '-')} "
                 f"PSS={mem_txt}kB {net_txt} 温度={temp_txt if temp_txt is not None else '-'}°C"
             )
-            time.sleep(max(0.05, args.interval))
+            # v61：连续失败退避——设备半死（每次 adb shell 阻塞至 timeout）时
+            # 降低主循环空转频率，避免把断连告警拖到最坏 3 分钟；恢复即回正常节奏。
+            time.sleep(backoff_sleep(args.interval, fail_streak))
 
     print(f"[=] 采集结束，共 {n} 个采样点。已保存: {out_file}")
 

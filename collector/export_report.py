@@ -38,6 +38,10 @@ COLUMNS = [
     ("rx_kbps", "下行KB/s"), ("tx_kbps", "上行KB/s"),
     ("temp_c", "电池温度C"), ("power_w", "功率W"),
     ("current_ma", "电流mA"), ("voltage_v", "电压V"),
+    # v61：FPS 采集质量标记（fps.py v59 起落盘）——长测导出分析时，出现"已钳制/
+    # 低置信"的点说明主段帧数过少或算出值超物理上限，应剔除或降权后再统计。
+    # 追加在末尾，不改动原有列序（按列名取值/按表头读取的下游不受影响）。
+    ("fps_clamped", "FPS已钳制"), ("fps_warn", "FPS低置信"),
 ]
 
 
@@ -107,6 +111,10 @@ def flatten(row):
     out.update({k: f.get(k) for k in ("fps", "jank_rate", "frame_p50_ms", "frame_p95_ms",
                                       "frame_max_ms", "refresh_hz")})
     out["fps_source"] = fps_source(f)
+    # v61：FPS 采集质量标记透出（钳制="是"；低置信沿用 fps_warn 原值如 low_frames）——
+    # 无标记留空，便于在 Excel 里筛选"哪些点不可信"。
+    out["fps_clamped"] = "是" if f.get("fps_clamped") else ""
+    out["fps_warn"] = str(f.get("fps_warn") or "")
     c = row.get("cpu") or {}
     out.update({"cpu_total_pct": c.get("cpu_total_pct"), "cpu_proc_pct": c.get("cpu_proc_pct")})
     m = row.get("mem") or {}

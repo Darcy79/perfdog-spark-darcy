@@ -42,6 +42,36 @@ APPS_CACHE_TTL = 60.0
 # 期间不再重复昂贵的 unzip 解析（此前失败不缓存导致每次下拉都重解析）
 LABEL_RETRY_INTERVAL = 24 * 3600.0
 
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def same_origin_ok(host_header, origin_header):
+    """POST 端点同源校验（v61 安全加固，纯函数便于单测）。
+
+    背景：看板只绑 127.0.0.1，但浏览器内任意网页都能用 no-cors 方式 POST
+    /api/stop、/api/shutdown、/api/switch-target（后者会写 config.json），
+    一场 1 小时采集可被静默炸掉；DNS rebinding 还能让"看起来同源"的请求
+    打到本机服务。防护策略（本地工具，不做认证）：
+      - Host 头必须是回环地址（含 IPv6 [::1]），否则拒绝；
+      - 带 Origin 的请求（浏览器发起）其 host 也必须是回环；跨站 Origin 拒绝；
+      - 无 Origin（curl / 脚本 / 同源表单导航等非浏览器调用）放行。
+    """
+    host_raw = (host_header or "").strip().lower()
+    if host_raw.startswith("["):            # IPv6 形如 [::1]:8080
+        host = host_raw.split("]")[0].lstrip("[")
+    else:
+        host = host_raw.split(":")[0]
+    if host and host not in _LOOPBACK_HOSTS:
+        return False
+    origin = (origin_header or "").strip()
+    if not origin:
+        return True
+    try:
+        ohost = (urlparse(origin).hostname or "").lower()
+    except Exception:
+        return False
+    return ohost in _LOOPBACK_HOSTS
+
 
 class WebServer:
     def __init__(self, port=8080, output_dir="output", adb=None, switch_cb=None):
@@ -417,6 +447,14 @@ class WebServer:
                 /api/switch-target?package=xx&process_pattern=yy
                     看板下拉切换被测应用：调用采集器 apply_target 热切换目标。
                 """
+                # v61（安全加固）：拒绝跨站 / 非回环 Host 的 POST——策略与理由见
+                # same_origin_ok() 注释。get 类端点均为只读且受浏览器同源策略保护，
+                # 仅对破坏性 POST 收紧。
+                if not same_origin_ok(self.headers.get("Host"), self.headers.get("Origin")):
+                    self._send(403, json.dumps(
+                        {"error": "forbidden: cross-origin request rejected"},
+                        ensure_ascii=False))
+                    return
                 parsed = urlparse(self.path)
                 qs = parse_qs(parsed.query)
                 if parsed.path == "/api/rename":
