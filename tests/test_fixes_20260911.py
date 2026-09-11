@@ -16,13 +16,14 @@ import os
 import sys
 import tempfile
 import unittest
+from collections import OrderedDict
 
 # 注入 collector 目录到 sys.path（main.py 以 collector 为运行根）
 _COLLECTOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "collector")
 if _COLLECTOR not in sys.path:
     sys.path.insert(0, _COLLECTOR)
 
-from web import same_origin_ok
+from web import same_origin_ok, trim_report_cache
 from main import backoff_sleep, FAIL_ALERT_STREAK, BACKOFF_MAX_S
 from export_report import COLUMNS, flatten, export_csv
 
@@ -120,6 +121,52 @@ class TestExportQualityColumns(unittest.TestCase):
         self.assertIn("FPS已钳制", header)
         self.assertIn("FPS低置信", header)
         self.assertIn("是", data)
+
+
+class TestReportCacheBudget(unittest.TestCase):
+    """报告缓存双预算：份数上限 + 采样点总数上限（v62，长测内存防护）。"""
+
+    @staticmethod
+    def _entry(n_points):
+        return (1, 2, [{"t_ms": i} for i in range(n_points)])
+
+    def test_evict_by_entry_count(self):
+        cache = OrderedDict()
+        for i in range(5):
+            cache["run%d" % i] = self._entry(10)
+        points = trim_report_cache(cache, 50, max_entries=3, max_points=100000)
+        self.assertEqual(len(cache), 3)
+        self.assertEqual(points, 30)
+        self.assertNotIn("run0", cache)      # LRU：最旧的先淘汰
+        self.assertIn("run4", cache)
+
+    def test_evict_by_points_budget(self):
+        cache = OrderedDict()
+        for i in range(3):
+            cache["run%d" % i] = self._entry(3000)     # 共 9000 点
+        points = trim_report_cache(cache, 9000, max_entries=50, max_points=5000)
+        self.assertLessEqual(points, 5000)
+        self.assertEqual(len(cache), 1)      # 淘汰到只剩最新那份
+        self.assertIn("run2", cache)
+
+    def test_single_oversized_entry_kept(self):
+        # 正在看的这份即使单份超预算也不淘汰自己（否则会"打开→立刻淘汰→再解析"死循环）
+        cache = OrderedDict()
+        cache["big"] = self._entry(60000)
+        points = trim_report_cache(cache, 60000, max_entries=50, max_points=50000)
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(points, 60000)
+
+    def test_no_eviction_when_within_budget(self):
+        cache = OrderedDict()
+        cache["a"] = self._entry(100)
+        points = trim_report_cache(cache, 100, max_entries=50, max_points=50000)
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(points, 100)
+
+    def test_empty_cache_noop(self):
+        cache = OrderedDict()
+        self.assertEqual(trim_report_cache(cache, 0, 3, 100), 0)
 
 
 if __name__ == "__main__":

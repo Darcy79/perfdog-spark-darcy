@@ -73,6 +73,30 @@ def same_origin_ok(host_header, origin_header):
     return ohost in _LOOPBACK_HOSTS
 
 
+def trim_report_cache(cache, points, max_entries, max_points):
+    """按"份数 + 采样点总数"双预算淘汰最久未使用的报告缓存（v62，纯函数便于单测）。
+
+    背景：_report_cache 每条是完整 rows 列表（每点一个 dict，1 万点约 10~30MB）。
+    原策略只按"份数 ≤ max_entries"淘汰，长测后连续打开多份长报告会把内存推到
+    GB 级。这里追加"缓存内采样点总数 ≤ max_points"预算：两者任一超限即从 LRU
+    端（last=False）淘汰；**至少保留 1 份**——正在看的那份即使单份超预算也不淘汰
+    自己（否则会陷入"打开→立刻被淘汰→再解析"的死循环）。
+
+    cache 条目约定：(mtime_ns, size, rows)。返回淘汰后的采样点总数。
+    """
+    def _pts(entry):
+        try:
+            return len(entry[2] or [])
+        except Exception:
+            return 0
+
+    while cache and (len(cache) > max_entries or
+                     (points > max_points and len(cache) > 1)):
+        _, evicted = cache.popitem(last=False)
+        points -= _pts(evicted)
+    return points
+
+
 class WebServer:
     def __init__(self, port=8080, output_dir="output", adb=None, switch_cb=None):
         self.port = port
@@ -115,6 +139,11 @@ class WebServer:
         self._report_cache = OrderedDict()
         # report 缓存条数上限：超过则按 LRU 逐条淘汰最久未使用项（语义不变，仍是防膨胀）
         self._report_cache_max = 50
+        # v62：采样点总数预算（长测内存防护）——每份缓存是完整 rows（每点一个 dict，
+        # 1 万点约 10~30MB），仅按"份数 ≤50"淘汰时，长测后连开多份长报告可把内存
+        # 推到 GB 级。追加点数预算后，份数与点数任一超限即从 LRU 端淘汰（至少留 1 份）。
+        self._report_cache_points = 0
+        self._report_cache_points_max = 50000
         # report 缓存互斥锁（2026-08-24）：ThreadingHTTPServer 下 /api/report 并发
         # 时缓存的 get/set/clear 可能交叉——GIL 只保证单条字节码原子，读改写序列
         # 不加锁仍可能读到不一致状态；加锁同时让同一报告的并发请求串行命中缓存，
@@ -822,10 +851,17 @@ class WebServer:
                                     rows.append(json.loads(line))
                     except Exception as e:
                         return {"error": str(e)}
+                    # 覆盖旧条目（jsonl 被追加写后 mtime/size 变化会走到这里）：先扣旧点数，
+                    # 否则同一点数被重复计入预算，会过早淘汰其他条目
+                    old_entry = server._report_cache.pop(name, None)
+                    if old_entry is not None:
+                        server._report_cache_points -= len(old_entry[2] or [])
                     server._report_cache[name] = (st.st_mtime_ns, st.st_size, rows)
                     server._report_cache.move_to_end(name)   # 覆盖旧条目时也要提到队尾
-                    while len(server._report_cache) > server._report_cache_max:
-                        server._report_cache.popitem(last=False)
+                    server._report_cache_points += len(rows)
+                    server._report_cache_points = trim_report_cache(
+                        server._report_cache, server._report_cache_points,
+                        server._report_cache_max, server._report_cache_points_max)
                     return rows
 
         return Handler
