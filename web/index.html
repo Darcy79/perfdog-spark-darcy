@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 实时看板</title>
-<link rel="stylesheet" href="/assets/style.css?v=58">
+<link rel="stylesheet" href="/assets/style.css?v=59">
 </head>
 <body>
 <header>
@@ -25,6 +25,27 @@
     <span id="st-elapsed">时长: 0s</span>
   </div>
 </header>
+
+<!-- v59 启动向导：用户确认目标进程后才开始记录（探测阶段不产生任何采集数据） -->
+<div id="wizard" class="wizard" style="display:none">
+  <div class="wizard-head">
+    <h2>① 选择要采集的进程</h2>
+    <span class="wizard-sub">确认「开始采集」之前不会记录任何数据</span>
+  </div>
+  <div id="wz-layer" class="wizard-layer"></div>
+  <div id="wz-list" class="wizard-list"></div>
+  <div class="wizard-foot">
+    <button id="wz-refresh" type="button" class="wz-btn ghost">↻ 重新探测</button>
+    <button id="wz-start" type="button" class="wz-btn primary" disabled>▶ 开始采集</button>
+    <span id="wz-msg" class="wz-msg"></span>
+  </div>
+</div>
+<!-- v59 采集期目标错配告警（层与进程索引不一致 → 可能采到别的小游戏实例） -->
+<div id="mismatch-banner" class="mismatch-banner" style="display:none">
+  <span id="mm-text"></span>
+  <button id="mm-stop" type="button" class="wz-btn danger">⏹ 停止并重新选择</button>
+  <button id="mm-hide" type="button" class="wz-btn ghost">忽略本次</button>
+</div>
 
 <main>
   <div class="drag-hint">↕ 拖动卡片可调整顺序（自动记住）</div>
@@ -58,8 +79,8 @@
   <span>自研 PerfDog · 数据仅存本地（output/*.jsonl）· <a href="/report.html">历史报告 →</a></span>
 </footer>
 
-<script src="/assets/echarts.min.js?v=58"></script>
-<script src="/assets/app.js?v=58"></script>
+<script src="/assets/echarts.min.js?v=59"></script>
+<script src="/assets/app.js?v=59"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
@@ -79,6 +100,7 @@
     charts.net = window.PerfCharts.makeChart('chart-net');
     charts.temp = window.PerfCharts.makeChart('chart-temp');
     initTarget();
+    initWizard();   // v59：启动向导按钮绑定
     refreshStatus();
     window.PerfCharts.initSortable('main');
     setInterval(refreshStatus, 2000);
@@ -123,6 +145,159 @@
     }).catch(function () {});
   }
 
+  // ---------------- v59 启动向导：选择要采集的进程 ----------------
+  // 设计：探测阶段（后端 phase=waiting）只展示候选与推荐，**不写任何采集数据**；
+  // 用户点「开始采集」→ POST /api/start 后后端才创建 jsonl 并开始采样。
+  var wzSel = null;      // 当前选中的 pid
+  var wzData = null;     // 最近一次探测结果
+
+  function wzEl(id) { return document.getElementById(id); }
+
+  function renderWizard(d) {
+    wzData = d || {};
+    var list = wzEl('wz-list');
+    var layer = wzData.layer || {};
+    wzEl('wz-layer').textContent = layer.name
+      ? ('游戏渲染层: ' + layer.name + '（AppBrandUI' + layer.appbrand_index + '）')
+      : '未识别到游戏渲染层（可手动选择候选进程）';
+    while (list.firstChild) list.removeChild(list.firstChild);
+    if (!wzData.ok) {
+      var err = document.createElement('div');
+      err.className = 'wz-msg';
+      err.textContent = wzData.error || '探测失败';
+      list.appendChild(err);
+      wzEl('wz-start').disabled = true;
+      return;
+    }
+    var cands = wzData.candidates || [];
+    if (!cands.length) {
+      var none = document.createElement('div');
+      none.className = 'wz-msg';
+      none.textContent = '未找到候选进程：请先在手机上打开被测小游戏并保持前台，再点「重新探测」';
+      list.appendChild(none);
+      wzEl('wz-start').disabled = true;
+      return;
+    }
+    cands.forEach(function (c) {
+      var row = document.createElement('div');
+      row.className = 'wz-item';
+      var radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = 'wz-pid';
+      radio.value = c.pid;
+      var name = document.createElement('span');
+      name.className = 'wz-name';
+      name.textContent = 'appbrand' + (c.index != null ? c.index : '?') + '  ·  pid ' + c.pid;
+      row.appendChild(radio);
+      row.appendChild(name);
+      if (c.recommended) {
+        var tag = document.createElement('span');
+        tag.className = 'wz-rec';
+        tag.textContent = '★ 推荐' + (c.detail ? '（' + c.detail + '）' : '');
+        row.appendChild(tag);
+      }
+      var meta = document.createElement('span');
+      meta.className = 'wz-meta';
+      meta.textContent = '内存 ' + (c.rss_mb != null ? c.rss_mb + ' MB' : '?') +
+        ' · CPU增量 ' + (c.cpu_delta_pct != null ? c.cpu_delta_pct + '%' : '?');
+      row.appendChild(meta);
+      row.onclick = function () { selectWz(c.pid); };
+      if (c.recommended) {
+        wzSel = c.pid;
+        radio.checked = true;
+        row.classList.add('sel');
+      }
+      list.appendChild(row);
+    });
+    wzEl('wz-start').disabled = (wzSel == null);
+  }
+
+  function selectWz(pid) {
+    wzSel = pid;
+    var items = document.querySelectorAll('#wz-list .wz-item');
+    for (var i = 0; i < items.length; i++) items[i].classList.remove('sel');
+    var radios = document.querySelectorAll('#wz-list input[name=wz-pid]');
+    for (var j = 0; j < radios.length; j++) {
+      if (Number(radios[j].value) === Number(pid)) {
+        radios[j].checked = true;
+        if (radios[j].parentNode) radios[j].parentNode.classList.add('sel');
+      }
+    }
+    wzEl('wz-start').disabled = false;
+  }
+
+  function loadCandidates(force) {
+    wzEl('wz-msg').textContent = '⏳ 正在探测…';
+    fetch('/api/candidates' + (force ? '?force=1' : ''))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        wzEl('wz-msg').textContent = '';
+        wzSel = null;
+        renderWizard(d);
+      })
+      .catch(function () { wzEl('wz-msg').textContent = '✘ 探测请求失败（看板服务可能已关闭）'; });
+  }
+
+  function startCapture() {
+    if (wzSel == null) return;
+    wzEl('wz-msg').textContent = '⏳ 正在开始采集…';
+    fetch('/api/start?pid=' + encodeURIComponent(wzSel), { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.ok) {
+          wzEl('wz-msg').textContent = '✔ 已开始采集（数据已开始记录）';
+          refreshStatus();
+        } else {
+          wzEl('wz-msg').textContent = '✘ ' + ((d && d.error) || '开始失败');
+        }
+      })
+      .catch(function () { wzEl('wz-msg').textContent = '✘ 请求失败'; });
+  }
+
+  // 根据 /api/status 的 phase 切换向导显示；mismatch 时展示采集期告警
+  function updateWizard(s) {
+    var box = wzEl('wizard');
+    if (box) {
+      if (s.phase === 'waiting') {
+        if (box.style.display === 'none') {
+          box.style.display = 'block';
+          loadCandidates(false);   // 首次出现时拉一次候选（8s TTL 内复用缓存）
+        }
+      } else if (box.style.display !== 'none') {
+        box.style.display = 'none';
+      }
+    }
+    var mm = wzEl('mismatch-banner');
+    if (mm) {
+      if (s.mismatch) {
+        var msg = s.mismatch.message || '检测到可能的采错进程';
+        if (mm.dataset.msg !== msg) {
+          mm.dataset.msg = msg;
+          mm.style.display = 'flex';   // 新的错配信息才重新弹出（"忽略本次"后不刷屏）
+        }
+        wzEl('mm-text').textContent = '⚠ ' + msg;
+      } else {
+        mm.style.display = 'none';
+        mm.dataset.msg = '';
+      }
+    }
+  }
+
+  function initWizard() {
+    if (wzEl('wz-refresh')) wzEl('wz-refresh').onclick = function () { loadCandidates(true); };
+    if (wzEl('wz-start')) wzEl('wz-start').onclick = startCapture;
+    if (wzEl('mm-stop')) {
+      wzEl('mm-stop').onclick = function () {
+        fetch('/api/stop', { method: 'POST' })
+          .then(function () { refreshStatus(); })
+          .catch(function () {});
+      };
+    }
+    if (wzEl('mm-hide')) {
+      wzEl('mm-hide').onclick = function () { wzEl('mismatch-banner').style.display = 'none'; };
+    }
+  }
+
   function refreshStatus() {
     fetch('/api/status').then(function (r) { return r.json(); }).then(function (s) {
       // v46：设备显示市场名+型号（有则），否则回退序列号
@@ -161,6 +336,7 @@
         window.PerfCharts.setCores(cores);
         render();
       }
+      updateWizard(s);   // v59：启动向导 / 采集期错配告警
     }).catch(function () {});
   }
 

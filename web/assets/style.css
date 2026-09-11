@@ -424,3 +424,50 @@ footer a { color: #4fc3f7; text-decoration: none; }
 
 /* Firefox：thin + scrollbar-color（继承到所有滚动容器，含 .run-list / body） */
 html { scrollbar-width: thin; scrollbar-color: rgba(120, 144, 156, 0.35) transparent; }
+
+/* v59 启动向导：选择要采集的进程（确认前不记录任何数据） */
+.wizard {
+  background: #16212c; border: 1px solid #263545; border-radius: 8px;
+  padding: 14px 16px; margin-bottom: 16px;
+}
+.wizard-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.wizard-head h2 { font-size: 15px; color: #4fc3f7; font-weight: 600; }
+.wizard-sub { font-size: 12px; color: #78909c; }
+.wizard-layer { font-size: 12px; color: #90a4ae; margin-bottom: 10px; word-break: break-all; }
+.wizard-list { display: flex; flex-direction: column; gap: 6px; }
+.wz-item {
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+  border: 1px solid #263545; border-radius: 6px; cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.wz-item:hover { background: #1c2a38; }
+.wz-item.sel { border-color: #4fc3f7; background: #22374a; }
+.wz-item .wz-name { font-size: 13px; color: #cfd8dc; white-space: nowrap; }
+.wz-item .wz-rec {
+  color: #a5d6a7; font-size: 11px; border: 1px solid rgba(165, 214, 167, .5);
+  border-radius: 10px; padding: 1px 8px; white-space: nowrap;
+}
+.wz-item .wz-meta { font-size: 12px; color: #78909c; margin-left: auto; white-space: nowrap; }
+.wizard-foot { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.wz-btn {
+  border-radius: 6px; border: 1px solid #263545; background: #1a2530;
+  color: #cfd8dc; font-size: 13px; padding: 6px 14px; cursor: pointer;
+  font-family: inherit; transition: border-color .15s, background .15s;
+}
+.wz-btn:hover { border-color: #4fc3f7; }
+.wz-btn.primary { background: #1e4d68; border-color: #4fc3f7; color: #e3f2fd; font-weight: 600; }
+.wz-btn.primary:disabled { opacity: .45; cursor: not-allowed; }
+.wz-btn.danger { border-color: #ef5350; color: #ef5350; }
+.wz-msg { font-size: 12px; color: #ffd54f; }
+
+/* v59 采集期目标错配告警横幅 */
+.mismatch-banner {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  background: rgba(239, 83, 80, .12); border: 1px solid #ef5350;
+  border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;
+  font-size: 13px; color: #ffcdd2;
+}
+@media (max-width: 900px) {
+  .wz-item { flex-wrap: wrap; }
+  .wz-item .wz-meta { margin-left: 0; width: 100%; }
+}

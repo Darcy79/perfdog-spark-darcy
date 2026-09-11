@@ -6,12 +6,12 @@
 
 ---
 
-## 当前状态（2026-09-11，v62）
+## 当前状态（2026-09-11，v63）
 
 | 项 | 值 |
 |---|---|
-| 前端资源版本 | **v58**（`web/index.html` + `web/report.html` 各 3 处 `?v=`） |
-| 测试 | Python **113** 条 + JS **59** 断言（全绿） |
+| 前端资源版本 | **v59**（`web/index.html` + `web/report.html` 各 3 处 `?v=`） |
+| 测试 | Python **131** 条 + JS **59** 断言（全绿） |
 | 采集环境 | Windows + adb 真机（荣耀 ADT-AN00 Magic3 Pro / OPPO；详见 `devices.md`） |
 | 工具链 | `uv`（Python）+ `bun`（JS 测试）+ `adb`；路径见 `AGENTS.md` §4 |
 
@@ -22,6 +22,37 @@
 - 待真机确认：开小游戏时 appbrand 进程的 `comm`/`cmdline` 实测值；OPPO 及其他品牌 `comm` 截断方向（首 15 / 末 15）；微信多开时 appbrand1/2 能否区分
 
 ---
+
+## v63（2026-09-11 · 主会话）
+
+**背景**：`20260911_133010` 报告再次采错进程（第 2 次同类事故）——采到 appbrand0
+（PSS 231MB、CPU 增量≈0），而游戏实际在 appbrand1（PSS 1035MB）；铁证是 FPS 层名
+`SurfaceView[...AppBrandUI1](BLAST)` 指向 appbrand1 而进程是 appbrand0（微信同时存在
+appbrand0/1/2 三实例）。v44 的"按累计 CPU 选最活跃"会偏向存在时间久的进程，且锁定后
+不再重选。**用户要求：双击启动后先轻量检测展示，用户选定进程、点开始采集之前不记录
+任何数据。**
+
+- **后端**（commit `0a88b2b`）：
+  · 新增 `collector/probe.py`——启动期只读探测（`parse_ps_candidates` /
+    `pick_game_layer`（挑 SurfaceView 游戏层并解析 `AppBrandUI(n)`，排除
+    InputSink/GestureNav/Input/Background）/ `parse_stat_ticks` / `parse_vmrss_kb` /
+    `probe_once`）；推荐优先级：**层索引匹配 > 探测窗增量 CPU 最大 > 第一候选**
+  · `main.py` 新增 `--auto`（跳过向导）；带 `--web` 默认走向导：探测（**不建任何采集
+    输出**）→ 终端打印候选/推荐 → 等待确认（网页 `/api/start` 或本窗口回车/输入 pid）
+    → **确认后才创建 jsonl 并采样**；采集期每 5s 做"层 vs 进程索引"错配自检，不一致写
+    `target_mismatch` 事件行 + 页面告警，**不自动切换**（切换前必先采错数据）
+  · `pidresolver.py` 新增 `fixed_pid` 模式：用户选定后固定采集该 pid，进程消失返回
+    None（缺数可见），不再自动改选
+  · `web.py` 新增 GET `/api/candidates`（TTL 8s）、POST `/api/start?pid=`（校验 pid
+    在候选中）；`status` 增 `phase` / `target_source` / `mismatch`
+- **前端**（本次提交）：`web/index.html` 启动向导卡片（候选列表 + 推荐标记 + 内存/CPU
+  增量 + 「开始采集」/「重新探测」）+ 采集期错配横幅（含「停止并重新选择」/「忽略本次」）；
+  `web/assets/style.css` 向导样式；`?v=` → 59
+- **测试**：新增 `tests/test_probe.py` 18 用例 → Python 131 条全绿
+- **真机验证**（荣耀 ADT-AN00）：探测识别层 `AppBrandUI1` → 推荐 **appbrand1**
+  （RSS 1266MB、CPU 增量 84%），采错的 appbrand0（196MB、0%）被标不推荐；接口端到端
+  验证：`/api/candidates` 200、非法 pid 被拒、`/api/start` 合法 pid 后
+  `take_start_request()` 恰取走一次、跨站 Origin 403
 
 ## v62（2026-09-11 · 主会话）
 
