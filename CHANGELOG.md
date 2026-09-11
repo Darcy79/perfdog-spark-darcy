@@ -6,12 +6,12 @@
 
 ---
 
-## 当前状态（2026-09-11，v63）
+## 当前状态（2026-09-11，v64）
 
 | 项 | 值 |
 |---|---|
 | 前端资源版本 | **v59**（`web/index.html` + `web/report.html` 各 3 处 `?v=`） |
-| 测试 | Python **131** 条 + JS **59** 断言（全绿） |
+| 测试 | Python **139** 条 + JS **59** 断言（全绿） |
 | 采集环境 | Windows + adb 真机（荣耀 ADT-AN00 Magic3 Pro / OPPO；详见 `devices.md`） |
 | 工具链 | `uv`（Python）+ `bun`（JS 测试）+ `adb`；路径见 `AGENTS.md` §4 |
 
@@ -22,6 +22,20 @@
 - 待真机确认：开小游戏时 appbrand 进程的 `comm`/`cmdline` 实测值；OPPO 及其他品牌 `comm` 截断方向（首 15 / 末 15）；微信多开时 appbrand1/2 能否区分
 
 ---
+
+## v64（2026-09-11 · 主会话）
+
+- **改动**：`collector/metrics/mem.py`（parse_meminfo 增解析 `TOTAL SWAP PSS` → 落盘
+  `swap_pss_kb`；MemCollector 结果新增该字段）；`collector/data_health.py`（`rss_lt_pss`
+  规则改用"非 swap PSS = pss − swap_pss"与 RSS 比较；swap 缺失时保持原口径）；
+  `tests/test_mem_swap.py` 新建（8 用例）
+- **为什么**：`dumpsys meminfo` 的 **TOTAL PSS 含 swap 部分**，进程被换出时会出现
+  PSS > RSS（真机 appbrand0：PSS 231MB / RSS 211MB / SWAP PSS 141MB），被规则误判为
+  "内存解析异常"（老报告 172/172 点全命中）
+- **影响面**：jsonl 的 `mem` 新增 `swap_pss_kb` 字段；**新采集不再产生该误报**；
+  历史数据（无 swap 字段）维持原判定口径，其 `rss_lt_pss` 告警可能为 swap 误报
+- **验证**：真机（fixed_pid=20621）采样得 `pss 1316615 / rss 1406756 / swap 101449`，
+  `check_row_health` 返回空（不误报）；测试 131 → 139 全绿
 
 ## v63（2026-09-11 · 主会话）
 

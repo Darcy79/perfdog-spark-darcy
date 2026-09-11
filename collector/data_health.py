@@ -88,10 +88,15 @@ def check_row_health(row):
     m = row.get("mem") or {}
     pss = m.get("pss_kb")
     rss = m.get("vmrss_kb")
-    if pss is not None and rss is not None and pss > 0:
-        # RSS 应 ≥ PSS（共享内存 RSS 全计、PSS 按比例摊）。缺口超过 1% 才判异常，
+    # v64：dumpsys 的 TOTAL PSS 含 swap 部分，进程被换出时 PSS 会大于 RSS（正常现象，
+    # 实测 appbrand0：PSS 231MB / RSS 211MB / SWAP PSS 141MB）。因此用"非 swap 的
+    # PSS"（pss - swap_pss）与 RSS 比较；swap 数据缺失时回退为原口径（便于老数据复检）。
+    swap = m.get("swap_pss_kb") or 0
+    eff_pss = pss - swap if (pss is not None) else None
+    if eff_pss is not None and rss is not None and eff_pss > 0:
+        # 非 swap PSS 应 ≤ RSS（共享内存 RSS 全计、PSS 按比例摊）。缺口超过 1% 才判异常，
         # 否则是 smaps_rollup 舍入/时序噪声（实测异常样本缺口中位仅 0.41%）。
-        if rss < pss and (pss - rss) > pss * RSS_LT_PSS_MIN_RATIO:
+        if rss < eff_pss and (eff_pss - rss) > eff_pss * RSS_LT_PSS_MIN_RATIO:
             issues.append("内存解析异常（RSS<PSS）")
     return issues
 

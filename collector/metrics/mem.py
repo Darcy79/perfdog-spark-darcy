@@ -20,6 +20,10 @@ _ROLLUP_PSS_RE = re.compile(r"^Pss:\s+(\d+)\s+kB", re.MULTILINE)
 # dumpsys meminfo App Summary 段：TOTAL PSS / TOTAL RSS（大小写不敏感）
 _TOTAL_PSS_RE = re.compile(r"TOTAL\s+PSS:\s*([\d,]+)", re.IGNORECASE)
 _TOTAL_RSS_RE = re.compile(r"TOTAL\s+RSS:\s*([\d,]+)", re.IGNORECASE)
+# v64：App Summary 会单列 TOTAL SWAP PSS，而 **TOTAL PSS 是含 swap 的总量**。
+# 进程被换出时会出现 PSS > RSS（实测 appbrand0：PSS 231MB / RSS 211MB / SWAP 141MB），
+# 这是正常现象而非解析错误——data_health 的 rss_lt_pss 规则据此排除误报。
+_TOTAL_SWAP_PSS_RE = re.compile(r"TOTAL\s+SWAP\s+PSS:\s*([\d,]+)", re.IGNORECASE)
 # 最末兜底：旧版主表 TOTAL 行（带 kB 后缀，Android 14 主表 TOTAL 行不带 kB，
 # 仅在 App Summary 段解析失败时兜底，误匹配风险已尽力压低）
 _TOTAL_RE = re.compile(r"TOTAL\s+(\d+)\s+kB")
@@ -62,6 +66,9 @@ def parse_meminfo(out):
         res["pss_kb"] = _kb(mp.group(1))
     if mr:
         res["rss_kb"] = _kb(mr.group(1))
+    ms = _TOTAL_SWAP_PSS_RE.search(out)
+    if ms:
+        res["swap_pss_kb"] = _kb(ms.group(1))
     return res
 
 
@@ -79,7 +86,7 @@ class MemCollector:
             return {"pid": None, "pss_kb": None, "vmrss_kb": None, "throttled": True}
         self._last_real_ts = ts
         pid = self.pid_resolver.current_pid(ts)
-        result = {"pid": pid, "pss_kb": None, "vmrss_kb": None}
+        result = {"pid": pid, "pss_kb": None, "vmrss_kb": None, "swap_pss_kb": None}
 
         # 1) 优先 smaps_rollup：毫秒级 + Pss/Rss 同源（Android 8+；部分 ROM SELinux 限制
         #    读他进程 smaps，失败自动回退 dumpsys）
@@ -124,4 +131,7 @@ class MemCollector:
                     result["vmrss_kb"] = int(mr.group(1))
             except Exception:
                 pass
+        # v64：swap PSS 一并落盘，供 data_health 的 rss_lt_pss 规则区分"换出导致的
+        # PSS>RSS（正常）"与"双源解析错位（异常）"
+        result["swap_pss_kb"] = d.get("swap_pss_kb")
         return result
