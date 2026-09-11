@@ -13,6 +13,7 @@
 import os
 import sys
 import json
+import subprocess
 import unittest
 
 # 注入 collector 目录到 sys.path（main.py 以 collector 为运行根）
@@ -25,6 +26,8 @@ from metrics.mem import parse_smaps_rollup, parse_meminfo, MemCollector
 from metrics.cpu import CpuCollector
 from metrics.thermal import ThermalCollector
 from pidresolver import PidResolver
+from adb import Adb, AdbError
+from main import ChannelAlertTracker, row_has_any_value
 from export_report import COLUMNS, flatten, extract_cores, data_rows, script_safe_json
 
 
@@ -172,7 +175,10 @@ class TestFpsLayerSwitch(unittest.TestCase):
         c.sample(1.0)
         self.assertTrue(c._ever_surfaceview)
 
-        adb.layer = None                          # 层销毁（切后台/重建中）
+        adb.layer = "com.android.launcher/RecentsActivity#5"
+        # ↑ v66 语义：--list 输出为空 = 链路读失败（probe_fail），所以"层销毁但
+        #   链路正常"要用"返回不匹配的系统层列表"模拟；SfMockAdb(None) 的空输出
+        #   现在归为 probe_fail（见 TestFpsProbeFail）
         r2 = c.sample(2.0)
         self.assertEqual(r2.get("error"), "layer_read_fail")
         r3 = c.sample(3.0)
@@ -705,16 +711,18 @@ class TestPidResolverParsing(unittest.TestCase):
         self.assertEqual(pid, 1697)     # 无子进程 → 回退主进程
 
     def test_resolve_comm_mismatch_triggers_recheck(self):
-        # pid 被系统复用：comm 不匹配期望 → current_pid 重新解析
+        # pid 被系统复用：cmdline 可读且明确不匹配 → current_pid 立即重新解析
+        # （v66 三态化：comm-only 不匹配属"未知"不再触发失效，见
+        #   TestPidResolverIdentity.test_comm_mismatch_only_is_unknown_three_strikes）
         adb = MockAdb({
             "ps -A -o PID,ARGS": "PID ARGS\n1697 com.tencent.mm\n5838 com.tencent.mm:appbrand0\n",
-            "cat /proc/1697/comm": "surfaceflinger\n",    # 身份已变
+            "cat /proc/1697/cmdline": "surfaceflinger\n",    # 身份已变（结论可靠）
         })
         r = PidResolver(adb, "com.tencent.mm", "appbrand")
         r.pid = 1697
         r._next_check = 0
         got = r.current_pid(ts=1.0)
-        self.assertEqual(got, 5838)     # comm 不符 → 重新解析到 appbrand 子进程
+        self.assertEqual(got, 5838)     # cmdline 不符 → 重新解析到 appbrand 子进程
 
 
 class TestPidResolverActivePick(unittest.TestCase):
@@ -1063,15 +1071,36 @@ class TestPidResolverIdentity(unittest.TestCase):
         self.assertEqual(got, 5838)
         self.assertEqual(len(self._ps_calls(adb)), 1)
 
-    def test_reused_pid_comm_fallback_still_reresolves(self):
-        # cmdline 读失败 + comm 也不匹配（真复用）→ 回退路径同样触发 re-resolve
+    def test_comm_mismatch_only_is_unknown_three_strikes(self):
+        # 2026-09-11 v66 三态化：cmdline 读失败 + comm 不匹配 ≠ 被复用
+        # （comm 截断方向因 ROM 而异，不匹配可能只是关键字被截掉）→ 属"未知"，
+        # 沿用旧 pid；连续 IDENTITY_FAIL_STREAK(3) 次未知才判失效 re-resolve
         r, adb = self._resolver({
             "cat /proc/5838/comm": "surfaceflinger\n",
         })
         adb.responses["ps -A -o PID,ARGS"] = \
             "PID ARGS\n1417 /system/bin/surfaceflinger\n7000 com.tencent.mm:appbrand1\n"
-        got = r.current_pid(ts=1.0)
-        self.assertEqual(got, 7000)
+        self.assertEqual(r.current_pid(ts=1.0), 5838)    # 第 1 次未知 → 沿用
+        self.assertEqual(r.current_pid(ts=10.0), 5838)   # 第 2 次未知 → 沿用
+        self.assertEqual(r.current_pid(ts=20.0), 7000)   # 第 3 次未知 → 判失效
+        self.assertEqual(len(self._ps_calls(adb)), 2)    # 仅初始 resolve + 失效后
+
+    def test_unknown_streak_resets_on_confirm(self):
+        # 未知累计被"确认"打断 → 计数清零，不会跨周期累积误判失效
+        r, adb = self._resolver({})
+        # 未知 1、2 → 确认（清零）→ 未知 1、2：五次校验都应沿用旧 pid
+        seq = [
+            {"cat /proc/5838/comm": "surfaceflinger\n"},
+            {"cat /proc/5838/comm": "surfaceflinger\n"},
+            {"cat /proc/5838/cmdline": "com.tencent.mm:appbrand0\x00"},
+            {"cat /proc/5838/comm": "surfaceflinger\n"},
+            {"cat /proc/5838/comm": "surfaceflinger\n"},
+        ]
+        for i, extra in enumerate(seq):
+            adb.responses.update(extra)
+            self.assertEqual(r.current_pid(ts=1.0 + i * 10.0), 5838,
+                             f"第 {i + 1} 次校验应沿用旧 pid")
+        self.assertEqual(len(self._ps_calls(adb)), 1)    # 全程未失效
 
 
 class TestMemNoPackageFallback(unittest.TestCase):
@@ -1111,6 +1140,195 @@ class TestScriptSafeJson(unittest.TestCase):
     def test_normal_data_untouched(self):
         rows = [{"t_ms": 0, "fps": {"fps": 59.9}, "note": "a<b>c</b>"}]
         self.assertEqual(json.loads(script_safe_json(rows, ensure_ascii=False)), rows)
+
+
+class RaisingAdb:
+    """--list 必抛的 adb 替身：模拟主机 adb 链路瞬断（2026-09-11 事故形态）。"""
+
+    def shell(self, args):
+        raise RuntimeError("adb: device 'X' not found")
+
+
+class TestFpsProbeFail(unittest.TestCase):
+    """区分"读失败"与"真的没有层"（2026-09-11 事故最高优先修复）。
+
+    事故：run 20260911_162353 主机 adb 通道瞬时失败，resolve_layer 的
+    `except: return None` 与"无匹配层"混用，51/63 点误报 no_layer
+    （"游戏不在前台"），层与进程实际全程都在，事后不可判读。
+    """
+
+    L = "SurfaceView[com.tencent.mm:appbrand0/AppUI]#776(BLAST)"
+
+    def _collector(self, adb):
+        return FpsCollector(adb, "com.tencent.mm", "appbrand", retry_interval=0.0)
+
+    def test_list_raise_reports_probe_fail(self):
+        # --list 抛异常（链路瞬断）→ probe_fail，不得报 no_layer
+        c = self._collector(RaisingAdb())
+        r = c.sample(1.0)
+        self.assertEqual(r["error"], "probe_fail")
+        self.assertIn("链路抖动", r["hint"])
+
+    def test_list_empty_output_reports_probe_fail(self):
+        # --list 执行成功但输出全空（正常时永远有系统层）→ probe_fail
+        adb = SfMockAdb(None, "")          # layer=None → --list 返回空
+        c = self._collector(adb)
+        r = c.sample(1.0)
+        self.assertEqual(r["error"], "probe_fail")
+
+    def test_list_ok_but_no_match_reports_no_layer(self):
+        # --list 正常返回、层名不含目标包/模式 → 保持 no_layer（语义兼容不变）
+        adb = SfMockAdb("com.other.app/MainActivity#9", "")
+        c = self._collector(adb)
+        r = c.sample(1.0)
+        self.assertEqual(r["error"], "no_layer")
+
+    def test_resolve_layer_old_signature_compat(self):
+        # 旧签名 resolve_layer() 仍只返回层名：异常 → None；正常 → 层名
+        self.assertIsNone(self._collector(RaisingAdb()).resolve_layer())
+        adb = SfMockAdb(self.L, "")
+        self.assertEqual(self._collector(adb).resolve_layer(), self.L)
+
+
+class TestAdbTransientRetry(unittest.TestCase):
+    """adb shell 瞬时通道错误轻量重试（2026-09-11 事故修复）。
+
+    默认重试 1 次（间隔 ~0.15s）：shell() 被多线程高频共用，多次重试会放大
+    设备负载。命令本身失败与超时不重试（超时重试单点最坏耗时翻倍到 40s）。
+    """
+
+    def _adb(self):
+        c = Adb.__new__(Adb)           # 跳过 __init__（无需真设备）
+        c._base = ["adb"]
+        c.serial = "TEST"
+        return c
+
+    def test_transient_error_retried_once_then_ok(self):
+        adb = self._adb()
+        calls = {"n": 0}
+
+        def fake_run(args, timeout=20):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise AdbError("adb 命令失败: adb shell error: closed")
+            return "ok"
+
+        adb._run = fake_run
+        self.assertEqual(adb.shell(["echo", "hi"]), "ok")
+        self.assertEqual(calls["n"], 2)          # 失败 1 次 + 重试成功
+
+    def test_transient_always_raises_after_exhausting_retry(self):
+        adb = self._adb()
+        calls = {"n": 0}
+
+        def fake_run(args, timeout=20):
+            calls["n"] += 1
+            raise AdbError("adb 命令失败: device offline")
+
+        adb._run = fake_run
+        with self.assertRaises(AdbError):
+            adb.shell(["echo", "hi"])
+        self.assertEqual(calls["n"], 2)          # 1 + 默认重试 1 次
+
+    def test_command_failure_not_retried(self):
+        # 命令本身失败（Permission denied）→ 重试无意义，立即抛
+        adb = self._adb()
+        calls = {"n": 0}
+
+        def fake_run(args, timeout=20):
+            calls["n"] += 1
+            raise AdbError("adb 命令失败: Permission denied")
+
+        adb._run = fake_run
+        with self.assertRaises(AdbError):
+            adb.shell(["cat", "/proc/1/smaps"])
+        self.assertEqual(calls["n"], 1)
+
+    def test_timeout_not_retried(self):
+        # 超时（20s）重试会让单点耗时翻倍 → 不重试，直接抛
+        adb = self._adb()
+        calls = {"n": 0}
+
+        def fake_run(args, timeout=20):
+            calls["n"] += 1
+            raise subprocess.TimeoutExpired(cmd="adb", timeout=20)
+
+        adb._run = fake_run
+        with self.assertRaises(subprocess.TimeoutExpired):
+            adb.shell(["dumpsys", "SurfaceFlinger", "--list"])
+        self.assertEqual(calls["n"], 1)
+
+    def test_retries_zero_disables_retry(self):
+        adb = self._adb()
+        calls = {"n": 0}
+
+        def fake_run(args, timeout=20):
+            calls["n"] += 1
+            raise AdbError("adb 命令失败: error: closed")
+
+        adb._run = fake_run
+        with self.assertRaises(AdbError):
+            adb.shell(["echo", "hi"], retries=0)
+        self.assertEqual(calls["n"], 1)
+
+
+class TestChannelAlertTracker(unittest.TestCase):
+    """缺数/断连事件状态机（2026-09-11 事故复盘）：状态沿触发、去重不刷屏。"""
+
+    def test_below_threshold_no_events(self):
+        t = ChannelAlertTracker()
+        self.assertEqual(t.update(["no_layer", "no_layer"]), [])
+        self.assertEqual(t.update([]), [])
+
+    def test_missing_metric_enter_dedup_recover(self):
+        t = ChannelAlertTracker()
+        ev = t.update(["no_layer", "no_layer", "read_fail"])
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["kind"], "missing_metric")
+        self.assertEqual(ev[0]["detail"]["err_codes"], {"no_layer": 2, "read_fail": 1})
+        # 状态沿去重：持续缺数不重复发事件
+        self.assertEqual(t.update(["no_layer", "no_layer", "read_fail"]), [])
+        rec = t.update(["no_layer"])
+        self.assertEqual([e["kind"] for e in rec], ["recovered"])
+        self.assertEqual(rec[0]["detail"]["scope"], "missing")
+
+    def test_disconnect_suppresses_missing_and_recovers(self):
+        t = ChannelAlertTracker()
+        ev = t.update(["no_layer"] * 4)
+        self.assertEqual([e["kind"] for e in ev], ["disconnect"])  # ≥4 不发 missing
+        self.assertEqual(t.update(["no_layer"] * 4), [])           # 沿不重发
+        rec = t.update([])
+        self.assertEqual([e["kind"] for e in rec], ["recovered"])
+
+    def test_escalation_missing_to_disconnect(self):
+        t = ChannelAlertTracker()
+        self.assertEqual([e["kind"] for e in t.update(["probe_fail"] * 3)],
+                         ["missing_metric"])
+        self.assertEqual([e["kind"] for e in t.update(["probe_fail"] * 4)],
+                         ["disconnect"])
+        rec = t.update([])
+        self.assertEqual(sorted(e["detail"]["scope"] for e in rec),
+                         ["disconnect", "missing"])
+
+
+class TestRowHasAnyValue(unittest.TestCase):
+    """首点落盘门槛（2026-09-11）：全空行跳过，error 行必须留痕。"""
+
+    def test_empty_bootstrap_row_skipped(self):
+        # 各指标线程尚未产出首份快照的全空行 → False（首点门槛跳过它）
+        self.assertFalse(row_has_any_value(
+            {"ts": 1.0, "t_ms": 400.0, "target": "com.tencent.mm"}))
+
+    def test_error_row_counts_as_value(self):
+        # error 也是信息（链路抖动首批 probe_fail 必须留痕，不能丢）
+        self.assertTrue(row_has_any_value({"fps": {"error": "probe_fail", "fps": None}}))
+
+    def test_value_and_throttled_rows(self):
+        self.assertTrue(row_has_any_value({"fps": {"fps": 60.0}}))
+        self.assertTrue(row_has_any_value({"mem": {"pss_kb": 100, "pid": 1}}))
+        # throttled（未到采样间隔的空点）不是有效值
+        self.assertFalse(row_has_any_value(
+            {"mem": {"pid": None, "pss_kb": None, "vmrss_kb": None, "throttled": True}}))
 
 
 if __name__ == "__main__":

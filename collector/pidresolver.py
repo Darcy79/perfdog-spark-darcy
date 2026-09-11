@@ -14,6 +14,13 @@
 
 import time
 
+# pid 身份校验"未知"容错阈值：连续 N 次读不到 cmdline/comm 才判 pid 失效。
+# 读不到 ≠ 进程消失——主机 adb 链路抖动时逐次误判会让 cpu/mem/net 整点缺数
+# （2026-09-11 事故 run 20260911_162353：63 点中 32 点 pid=None，实际进程与
+# 渲染层全程都在）；但真进程死亡后也不能无限沿用旧 pid 采错数据，连续 3 次
+# （校验周期 5s，约 10-15s）即判失效，由 data_health 连续缺失规则兜底标注。
+IDENTITY_FAIL_STREAK = 3
+
 
 class PidResolver:
     def __init__(self, adb, package, process_pattern="appbrand",
@@ -37,6 +44,9 @@ class PidResolver:
         if fixed_pid:
             self.pid = fixed_pid
             self.proc_name = fixed_name
+        # 身份校验"未知"连续计数（读不到 cmdline/comm 的次数），跨校验周期累积；
+        # 校验结果为确认/明确不匹配时清零（观测入口：resolver._id_unknown_streak）
+        self._id_unknown_streak = 0
 
     def resolve(self):
         """重新解析目标进程 pid，找不到返回 None（带 5s 失败节流）。
@@ -158,18 +168,23 @@ class PidResolver:
         return []
 
     def _identity_ok(self, pid):
-        """校验 pid 是否仍属于期望进程（2026-09-11 修正 comm 校验矛盾）。
+        """校验 pid 是否仍属于期望进程，三态返回（2026-09-11 事故修复）：
 
-        旧实现只比对 comm——而 Android comm 截断 15 字符（如
-        "com.tencent.mm:appbrand0" → "com.tencent.mm:"），按代码自己文档化的
-        截断假设，"appbrand" 必不在截断后的 comm 里 → 对正确的 appbrand 进程
-        校验恒失败：每 5s 触发一次 pid=None → resolve() 又被 5s 节流挡住，
-        cpu/mem/net 曲线出现规律性 no_pid 空洞。改为两级校验：
+          True  = 身份确认（cmdline 或 comm 匹配）
+          False = cmdline 可读且明确不匹配 → pid 一定被复用（调用方立即判失效）
+          None  = 读不到（异常 / 输出为空）→ "未知"，调用方沿用旧 pid 容错
+
+        区分 False 与 None 是本修复的核心：读不到多半是主机 adb 链路抖动，
+        误判成"进程消失"会让 cpu/mem/net 整点缺数（run 20260911_162353：
+        63 点中 32 点 pid=None，事后证实进程与渲染层全程都在）；而 cmdline
+        明确不匹配是真复用，必须立即处理不能拖。
+        两级比对（2026-09-11 comm 矛盾修正的延续）：
           1) cmdline（首选）：Android 应用进程 cmdline[0] 即完整进程名，与
              resolve() 记录的 proc_name（ps ARGS 列）或 _expect 做包含匹配；
-             可读且不匹配 → pid 一定被复用（结论可靠）；
-          2) comm（回退）：cmdline 读取失败（SELinux/极旧内核）时退回宽松
-             包含匹配——可能漏判截断形态，但不会误杀正确进程。
+             可读且不匹配 → 结论可靠，返回 False；
+          2) comm（回退）：comm 截断 15 字符且截断方向因 ROM 而异（荣耀为
+             末 15、标准 Linux 为首 15），匹配成功可确认（True）；**不匹配
+             不作为否定结论**——可能只是关键字被截掉 → 返回 None（未知）。
         """
         # 1) cmdline 完整进程名比对
         try:
@@ -181,20 +196,27 @@ class PidResolver:
                         or (self._expect and self._expect in cmdline):
                     return True
                 return False     # cmdline 可读但不匹配 → pid 已被复用
+            # 读到了但为空（进程刚 fork 等瞬态）：不足以下结论 → 走 comm
         except Exception:
             pass
-        # 2) comm 回退（宽松包含匹配）
+        # 2) comm 回退（只用于确认，不用于否定——截断方向因 ROM 而异）
         try:
             comm = self.adb.shell(["cat", f"/proc/{pid}/comm"]).strip()
             if comm and self._expect and self._expect in comm:
                 return True
         except Exception:
             pass
-        return False
+        return None
 
     def current_pid(self, ts=0.0):
         """校验进程仍存在且身份未变，进程消失/被复用则重新解析。
 
+        三态容错（2026-09-11）：
+          - 身份确认 → 沿用，未知计数清零；
+          - cmdline 明确不匹配（被复用）→ 立即判失效（保持原语义，不能拖）；
+          - 读不到（未知）→ 沿用旧 pid 并累计 _id_unknown_streak，连续
+            IDENTITY_FAIL_STREAK 次才判失效（链路抖动不丢点；真进程死亡
+            最多多沿用 (N-1)×5s ≈ 10s）。
         ts 为当前时间；默认未传则立即校验（兼容旧调用）。
         按 _check_interval 节流：在校验窗口内直接返回缓存的 pid。
         """
@@ -202,10 +224,21 @@ class PidResolver:
             if ts and ts < self._next_check:
                 return self.pid        # 校验窗口内，直接用缓存
             self._next_check = ts + self._check_interval
-            if self._identity_ok(self.pid):
+            verdict = self._identity_ok(self.pid)
+            if verdict is True:
+                self._id_unknown_streak = 0
                 return self.pid
-            # 身份不匹配 / 读取失败：pid 已失效或被复用
-            self.pid = None
+            if verdict is False:
+                # cmdline 可读且明确不匹配 → pid 一定被复用，立即失效
+                self._id_unknown_streak = 0
+                self.pid = None
+            else:
+                # 读不到 = 未知：沿用旧 pid，连续 N 次才判失效
+                self._id_unknown_streak += 1
+                if self._id_unknown_streak < IDENTITY_FAIL_STREAK:
+                    return self.pid
+                self._id_unknown_streak = 0
+                self.pid = None
             if self._fixed_pid:
                 # 用户指定进程模式：失效即停采该目标（指标缺数、页面可告警），
                 # 不自动改选——避免"同一份数据前后不同进程"的静默脏数据

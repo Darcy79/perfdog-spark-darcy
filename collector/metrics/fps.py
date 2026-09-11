@@ -33,6 +33,10 @@
   - 游戏不在前台 → 渲染层销毁 → 报 no_layer，5s 节流重试 --list
   - --latency 读取失败 → 层已失效，立即重匹配
   - 0 帧/静止 = 游戏确实没在渲染，是合法结果，不误换层
+  - --list 本身读失败/输出为空 → 报 probe_fail（2026-09-11 新增）：此前与
+    no_layer 混用，主机 adb 链路瞬时失败被误报成"游戏不在前台"，
+    事后完全不可判读（run 20260911_162353：51/63 点误报 no_layer，
+    实际层与进程全程都在）
 """
 
 import math
@@ -147,20 +151,33 @@ class FpsCollector:
         # （gfxinfo 对 WebGL 恒 0 帧，切过去 FPS 会永久归零，2026-08-21 真机 673s 后暴露）
         self._ever_surfaceview = False
         self._gfx_zero_streak = 0   # gfxinfo 连续 0 帧计数（兜底回退 sf）
+        # 最近一次层探测的错误码（None=成功/未探测，"no_layer"/"probe_fail"），
+        # 供 sample() 在无层时上报正确错误类型（2026-09-11 事故修复）
+        self._last_probe_err = None
 
     def resolve_layer(self):
-        """匹配目标应用渲染层，返回含 #id 的完整层名（荣耀 Android14 必须带 #id）。
+        """旧签名兼容：只返回层名（可能 None）。错误码区分见 resolve_layer_ex()。"""
+        return self.resolve_layer_ex()[0]
+
+    def resolve_layer_ex(self):
+        """匹配目标应用渲染层，返回 (layer, err)。err 三值（2026-09-11 事故修复）：
+          None         匹配成功（layer 非 None）
+          "no_layer"   --list 执行成功但没有匹配层（应用不在前台/渲染层未创建）
+          "probe_fail" --list 执行失败（异常）或输出为空（adb 链路抖动/设备半死）
 
         优先级：
           1) SurfaceView[...](BLAST)  —— SurfaceView 渲染（小游戏/视频类，帧统计最准）
           2) SurfaceView[...]         —— 普通 SurfaceView
           3) 应用窗口层 com.pkg/...Activity#id —— 普通 View 渲染的应用（无 SurfaceView）
-        按包名/进程模式匹配；找不到返回 None。支持任意 App（2026-08-13 扩展）。
+        按包名/进程模式匹配；支持任意 App（2026-08-13 扩展）。
         """
         try:
             out = self.adb.shell(["dumpsys", "SurfaceFlinger", "--list"])
         except Exception:
-            return None
+            return None, "probe_fail"
+        if not out or not out.strip():
+            # --list 正常时永远有系统层输出；全空 = 链路异常而非"无渲染层"
+            return None, "probe_fail"
 
         def _hit(raw):
             if self.package and self.package not in raw:
@@ -193,7 +210,8 @@ class FpsCollector:
                 continue
             window.append(raw)
         # 优先 BLAST，其次普通 SurfaceView，最后窗口层（普通 View 应用）
-        return (blast or normal or window or [None])[0]
+        layer = (blast or normal or window or [None])[0]
+        return layer, (None if layer else "no_layer")
 
     def _reset_frame_baseline(self):
         """清空与"当前层缓冲"绑定的帧统计基准（层重建后旧基准全部失效）。
@@ -225,9 +243,17 @@ class FpsCollector:
         return layer
 
     def _try_resolve(self, ts):
+        """节流重匹配渲染层。返回是否真正执行了探测。
+
+        探测错误码记入 _last_probe_err（层找到时清 None），供 sample() 在
+        无层时区分 no_layer / probe_fail 上报（2026-09-11 事故修复）。
+        """
         if ts >= self._next_resolve:
-            self._set_layer(self.resolve_layer())
+            layer, err = self.resolve_layer_ex()
+            self._last_probe_err = None if layer else (err or "no_layer")
             self._next_resolve = ts + self.retry_interval
+            if layer:
+                self._set_layer(layer)
             return True
         return False
 
@@ -397,19 +423,23 @@ class FpsCollector:
         if not self.layer:
             self._try_resolve(ts)
             if not self.layer:
+                # 上报"读失败"与"真的没有层"的正确错误码（2026-09-11 事故修复）：
+                # 主机 adb 链路抖动是 probe_fail，不得再误报 no_layer（应用不在前台）
+                err = self._last_probe_err or "no_layer"
+                hint = ("渲染层读取失败(链路抖动)" if err == "probe_fail" else None)
                 # 之前匹配到过 SurfaceView 层（微信小游戏等）→ 层只是暂时丢失（重建/切场），
                 # 保留 sf 通道等 5s 重匹配找回；此时切 gfxinfo 会因 WebGL 恒 0 帧让 FPS 永久归零
                 if self._ever_surfaceview:
                     return {"layer": None, "total_frames": None, "fps": None,
-                            "jank_rate": None, "error": "no_layer",
-                            "hint": "渲染层暂失,重匹配中"}
+                            "jank_rate": None, "error": err,
+                            "hint": hint or "渲染层暂失,重匹配中"}
                 # 从未有 SurfaceView 层：可能是普通 View 应用 → 试 gfxinfo
                 if self._gfx_read() is not None:
                     self._switch_to_gfx(ts)
                     return self._sample_gfx(ts)
                 return {"layer": None, "total_frames": None, "fps": None,
-                        "jank_rate": None, "error": "no_layer",
-                        "hint": "应用未在前台或无渲染层"}
+                        "jank_rate": None, "error": err,
+                        "hint": hint or "应用未在前台或无渲染层"}
 
         try:
             out = self.adb.shell(["dumpsys", "SurfaceFlinger", "--latency", self.layer])

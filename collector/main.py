@@ -72,6 +72,78 @@ def backoff_sleep(base_iv, fail_streak):
     return min(base * streak, BACKOFF_MAX_S)
 
 
+def row_has_any_value(row):
+    """判断采样行是否包含至少一个有效指标值（首点落盘门槛用，纯函数）。
+
+    "有效" = 任一指标 dict 有非 None 的关键值，**或任一指标带 error**——
+    失败本身也是信息（链路抖动时的首批 probe_fail 行必须留痕，否则事后
+    更无法判读），只有"各指标线程尚未产出首份快照"的全空行才该跳过
+    （2026-09-11 实测：首点 t≈0.4s 全指标 None）。throttled 不是有效值。
+    """
+    for k in ("fps", "cpu", "mem", "net", "therm"):
+        v = row.get(k)
+        if not isinstance(v, dict):
+            continue
+        if v.get("error"):
+            return True
+        for kk in ("fps", "cpu_total_pct", "cpu_proc_pct", "pss_kb", "vmrss_kb",
+                   "rx_kbps", "tx_kbps", "temp_c", "power_w", "voltage_v"):
+            if v.get(kk) is not None:
+                return True
+    return False
+
+
+class ChannelAlertTracker:
+    """缺数/断连事件状态机（纯逻辑，可单测；2026-09-11 事故复盘新增）。
+
+    背景：断连告警此前只 print + set_status，不写 jsonl——run 20260911_162353
+    出现大面积空洞后无法从数据判断"当时链路是否故障"，事后不可判读。
+    两个独立维度的进入/恢复沿各发一次事件（状态沿去重 = 天然节流，不刷屏）：
+      missing_metric：≥MISSING_ERR_COUNT 个指标带 error 且未达断连阈值
+                      → 事件带错误码分布 detail；
+      disconnect    ：≥DISCONNECT_ERR_COUNT（多数指标 error，与原断连告警
+                      阈值一致）→ 更严重，只发 disconnect（不发 missing）；
+      recovered     ：任一维度从"在状态"回到阈值以下。
+    update(err_codes) 传入本轮带 error 的指标错误码列表，返回事件 dict 列表
+    （不含 ts，由落盘方补），可为空。事件行带 event 字段，前端 prepareRows /
+    导出 data_rows / data_health 均按该字段跳过，不参与采样点统计。
+    """
+
+    DISCONNECT_ERR_COUNT = 4   # 5 个指标中 ≥4 带 error（沿用原断连告警阈值）
+    MISSING_ERR_COUNT = 3
+
+    def __init__(self):
+        self._in_disconnect = False
+        self._in_missing = False
+
+    def update(self, err_codes):
+        events = []
+        n = len(err_codes)
+        dist = {}
+        for c in err_codes:
+            dist[c] = dist.get(c, 0) + 1
+        # --- 缺数维度（3 ≤ n < 4）：进入沿只发一次，带错误码分布 ---
+        if self.MISSING_ERR_COUNT <= n < self.DISCONNECT_ERR_COUNT \
+                and not self._in_missing:
+            self._in_missing = True
+            events.append({"event": "channel_alert", "kind": "missing_metric",
+                           "detail": {"err_count": n, "err_codes": dist}})
+        elif n < self.MISSING_ERR_COUNT and self._in_missing:
+            self._in_missing = False
+            events.append({"event": "channel_alert", "kind": "recovered",
+                           "detail": {"err_count": n, "scope": "missing"}})
+        # --- 断连维度（n ≥ 4）：进入沿发 disconnect，恢复发 recovered ---
+        if n >= self.DISCONNECT_ERR_COUNT and not self._in_disconnect:
+            self._in_disconnect = True
+            events.append({"event": "channel_alert", "kind": "disconnect",
+                           "detail": {"err_count": n, "err_codes": dist}})
+        elif n < self.DISCONNECT_ERR_COUNT and self._in_disconnect:
+            self._in_disconnect = False
+            events.append({"event": "channel_alert", "kind": "recovered",
+                           "detail": {"err_count": n, "scope": "disconnect"}})
+        return events
+
+
 def main():
     ap = argparse.ArgumentParser(description="自研 PerfDog 采集器（第一阶段：FPS/CPU/内存）")
     ap.add_argument("--config", default="config.json", help="配置文件路径")
@@ -483,9 +555,12 @@ def main():
 
     start = time.time()
     n = 0
+    wrote_any = False   # 首点门槛：写出第一行有效数据前跳过全空行（任务⑤）
     # 设备断连诊断（2026-08-21）：连续 N 轮多数指标报错 → 探活 adb devices 醒目告警
     fail_streak = 0
     diag_shown = False
+    # 缺数/断连事件状态机（2026-09-11 事故复盘）：告警同时落盘事件行，事后可判读
+    channel_alerts = ChannelAlertTracker()
     # 数据健全性实时自检（2026-08-27）：每轮对当前快照跑轻量规则，连续命中才告警，
     # 复用断连告警的"连续 N 轮才提醒"思路，避免单点噪声刷屏
     health_streak = {}
@@ -513,8 +588,15 @@ def main():
                         row[k] = latest[k]
 
             # 断连监测：本轮多数指标带 error → 累计；恢复后清零
-            err_count = sum(1 for k in SAMPLER_INTERVALS
-                            if isinstance(row.get(k), dict) and row[k].get("error"))
+            err_codes = [row[k].get("error") for k in SAMPLER_INTERVALS
+                         if isinstance(row.get(k), dict) and row[k].get("error")]
+            err_count = len(err_codes)
+            # 缺数/断连事件落盘（2026-09-11 事故复盘）：状态沿触发，去重不刷屏。
+            # 事件行带 event 字段，前端 prepareRows / 导出 data_rows /
+            # data_health 均按该字段跳过，不参与采样点统计。
+            for ev in channel_alerts.update(err_codes):
+                f.write(json.dumps({"ts": round(ts, 3), **ev},
+                                   ensure_ascii=False) + "\n")
             if err_count >= len(SAMPLER_INTERVALS) - 1:
                 fail_streak += 1
                 if fail_streak >= FAIL_ALERT_STREAK and not diag_shown:
@@ -539,11 +621,17 @@ def main():
             for msg in health_alerts:
                 print(f"[!] 数据健全性告警: {msg}", flush=True)
 
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            f.flush()
-            n += 1
-            if web:
-                web.add_sample(row)
+            # 首点门槛（2026-09-11）：采集启动后各指标线程尚未产出首份快照时，
+            # 首行全空（实测首点 t≈0.4s 全指标 None）。跳过"任何指标都无值"的行
+            # 直到写出第一行有效数据；之后即使某行暂时全空也照写（中断/恢复形态
+            # 要留痕）。主循环节奏未变，不影响 t_ms 起点语义与 --duration 计时。
+            if wrote_any or row_has_any_value(row):
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                f.flush()
+                n += 1
+                wrote_any = True
+                if web:
+                    web.add_sample(row)
 
             # logcat 事件轮询落盘（与采样点同目录，供看板叠加标注层）
             if monitor and events_file:
@@ -561,6 +649,8 @@ def main():
             err = fps_v.get("error")
             if err == "no_layer":
                 fps_txt = "无渲染层(游戏请在微信前台)"
+            elif err == "probe_fail":
+                fps_txt = "渲染层读取失败(链路抖动)"
             elif err == "layer_read_fail":
                 fps_txt = "渲染层失效,重匹配中"
             elif fps_v.get("fps") is not None:

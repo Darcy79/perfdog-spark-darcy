@@ -14,10 +14,21 @@ adb 定位策略：依次探测候选路径，用 `adb version` 验证可用性�
 import os
 import shutil
 import subprocess
+import time
 
 
 class AdbError(Exception):
     """ADB 相关错误，带用户可读的中文信息。"""
+
+
+# 瞬时通道错误特征（对异常文本做小写包含匹配）：adb 链路抖动，重试可能恢复。
+# 命令本身失败（Permission denied / No such file or directory 等）重试无意义。
+# （2026-09-11 事故：主机 adb 通道瞬时失败被逐指标判成 no_layer/pid 失效，
+# 造成大面积数据空洞；单次重试即可消除大部分瞬时抖动。）
+_TRANSIENT_ERRORS = (
+    "error: closed", "device offline", "device not found",
+    "adb: device", "connection reset",
+)
 
 
 def _find_adb():
@@ -99,15 +110,42 @@ class Adb:
             pass
         return False
 
-    def shell(self, args):
+    @staticmethod
+    def _is_transient(exc):
+        """判定是否为值得重试的 adb 瞬时通道错误。
+
+        超时（subprocess.TimeoutExpired）**不算**可重试错误——20s 超时后再重试
+        一次，单点最坏耗时翻倍到 40s；且超时通常意味设备端长时间无响应，立即
+        重试大概率仍超时。取舍：超时直接抛出，由上层退避节奏处理
+        （main.backoff_sleep）。
+        """
+        if isinstance(exc, subprocess.TimeoutExpired):
+            return False
+        s = str(exc).lower()
+        return any(k in s for k in _TRANSIENT_ERRORS)
+
+    def shell(self, args, retries=1):
         """执行 adb shell 命令，返回 stdout 文本。
+
+        瞬时通道错误（error: closed / device offline 等）自动重试 retries 次
+        （默认 1 次，间隔 ~0.15s）；命令本身失败与超时不重试。
+        默认仅 1 次：本方法被 fps(0.5s)/cpu(1s)/mem(2s) 等高频采样线程共用，
+        多次重试会成倍放大设备负载与最坏单点延迟。
 
         参数统一用单引号包裹再发给设备端 shell——
         layer 名含 [ ] ( ) 等 shell 特殊字符（如 SurfaceView[com.tencent.mm/...]），
         不包裹会被 glob/子shell 展开导致命令失败。
         """
         quoted = ["'" + a.replace("'", "'\\''") + "'" for a in args]
-        return self._run(["shell"] + quoted)
+        attempt = 0
+        while True:
+            try:
+                return self._run(["shell"] + quoted)
+            except Exception as e:
+                attempt += 1
+                if attempt > retries or not self._is_transient(e):
+                    raise
+                time.sleep(0.15)
 
     def exec_out(self, args, timeout=30):
         """执行 adb exec-out，返回原始 stdout（bytes，保留二进制）。

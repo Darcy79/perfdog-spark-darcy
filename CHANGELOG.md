@@ -6,12 +6,12 @@
 
 ---
 
-## 当前状态（2026-09-11，v65）
+## 当前状态（2026-09-11，v66）
 
 | 项 | 值 |
 |---|---|
 | 前端资源版本 | **v60**（`web/index.html` + `web/report.html` 各 3 处 `?v=`） |
-| 测试 | Python **139** 条 + JS **59** 断言（全绿） |
+| 测试 | Python **156** 条 + JS **59** 断言（全绿） |
 | 采集环境 | Windows + adb 真机（荣耀 ADT-AN00 Magic3 Pro / OPPO；详见 `devices.md`） |
 | 工具链 | `uv`（Python）+ `bun`（JS 测试）+ `adb`；路径见 `AGENTS.md` §4 |
 
@@ -22,6 +22,36 @@
 - 待真机确认：开小游戏时 appbrand 进程的 `comm`/`cmdline` 实测值；OPPO 及其他品牌 `comm` 截断方向（首 15 / 末 15）；微信多开时 appbrand1/2 能否区分
 
 ---
+
+## v66（2026-09-11 · 智谱GLM5.3flash 编码 + 主会话核实）
+
+- **改动**：`collector/metrics/fps.py`（`resolve_layer_ex()` 返回 `(layer, err)`，把「读失败」
+  与「真的没有层」分开：`--list` 异常/输出空 → 新错误码 **`probe_fail`**；`--list` 成功但
+  无匹配层 → 保持 `no_layer`；旧签名 `resolve_layer()` 保留兼容）；
+  `collector/pidresolver.py`（身份校验三态：`True` 确认 / `False` cmdline 可读且明确不匹配
+  → 立即失效 / **`None` 读不到 = 未知** → 沿用旧 pid，连续 `IDENTITY_FAIL_STREAK = 3` 次
+  才判失效；comm 不匹配只算未知不算否定——截断方向因 ROM 而异）；
+  `collector/adb.py`（`shell(args, retries=1)`：瞬时通道错误 `error: closed` / `device
+  offline` / `device not found` / `connection reset` 重试 1 次、间隔 0.15s；命令本身失败
+  与**超时不重试**）；`collector/main.py`（新增 `ChannelAlertTracker` 状态机 → 断连/缺数
+  写 jsonl 事件行 `channel_alert`（kind = `disconnect` / `missing_metric` / `recovered`，
+  状态沿触发天然去重）；新增 `row_has_any_value()` 首点门槛修复首点全空；控制台文案补
+  `probe_fail`）；`tests/test_parsers.py`（+17 用例，139 → **156**）
+- **为什么**：run `20260911_162353`（16:23:53–16:24:55）63 点中 **51 点误报 `no_layer`**、
+  32 点 `pid=None`，事后核对**层（`#18944`）与进程（13694）全程都在**，且同代码同设备
+  事后三轮实测全绿（组件级 75s、9 流并发压测 45s、真实采集器 70s 均零缺数）、Windows
+  无 USB 事件、设备 logcat 无异常 ⇒ 实为**主机 adb 通道瞬时失败**；但代码把「读不到」
+  归因为「层不存在 / 进程消失」，且告警只打印不落盘，导致数据大面积空洞**且事后不可判读**
+- **影响面**：新增错误码 `probe_fail`（历史数据的 `no_layer` 语义不变）；jsonl 新增
+  `channel_alert` 事件行（前端 `prepareRows`、导出 `data_rows`、`data_health` 均按 `event`
+  字段跳过——已核实）；采集首点不再全空；pid 判失效最多延后 ~10s（真死亡）
+- **验证**：① **156 测试全绿**（`uv run --no-project python -m unittest discover -s tests -p "test_*.py"`）；
+  ② 真机 60s 抽检（主会话独立跑）：59/59 点有 FPS，`no_layer=0 / probe_fail=0 / mem.pid=None=0 /
+  cpu.pid=None=0`，首点 `t_ms=1000.8` 即含 FPS；③ 主会话独立降级验证（stub `--list` 抛异常）：
+  连续 6 点均为 `probe_fail`、通道保持 `sf` 且零 `gfxinfo` 调用、含 `channel_alert` 的 jsonl
+  导出正常且事件行不进入内联数据
+- **未决**：`channel_alert` 的真机端到端形态未实测（60s 正常运行零故障）；报告页对
+  `probe_fail` / `no_layer` 的差异化标注与「缺数率」展示待做（web 域，主会话）
 
 ## v65（2026-09-11 · 主会话）
 
