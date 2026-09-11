@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=57">
+<link rel="stylesheet" href="/assets/style.css?v=58">
 </head>
 <body>
 <header>
@@ -50,7 +50,14 @@
           <b>虚线标注</b>：蓝色=日志事件（场景/进入/退出）、红色=报错事件（logcat 采集）<br>
           <b>↕ 拖动卡片</b>：调整图表顺序（自动记住）<br>
           <b>顶部时间条</b>：拖两端 ↔缩放 · 拖中间 =平移 · 点空白 =窗口跳转（全图联动）<br>
-          <b>📄</b>：列表项图标可在新窗口打开可分享的自包含报告
+          <b>📄</b>：列表项图标可在新窗口打开可分享的自包含报告<br>
+          <hr style="border:0;border-top:1px solid #263545;margin:6px 0;">
+          <b>统计口径</b>：<br>
+          帧时间 P95 = 各采样点 frame_p95_ms 的<b>算术平均</b>（非全体帧的 P95）<br>
+          卡顿率 = 各采样点 jank_rate 的<b>算术平均</b>（非总 jank 帧 / 总帧）<br>
+          网络 = 整机流量（除 lo），非进程级<br>
+          Jank 判定 = 2 × 节奏 × 1.1；节奏 = 帧间隔中位数吸附 60/90/120/144Hz 档（10% 容差）<br>
+          FPS = 0.5s gap 切段取帧数最多主段，主段 (帧数−1) / span
         </div>
       </div>
       <!-- v48（UI优化 3.1）：全局单时间条（控制所有图表缩放），原 6 图各挂一条已去除 -->
@@ -88,8 +95,8 @@
 <!-- v48（UI优化 3.4）：深色 toast 浮层（替代失败类 alert） -->
 <div class="pd-toast" id="pd-toast"></div>
 
-<script src="/assets/echarts.min.js?v=57"></script>
-<script src="/assets/app.js?v=57"></script>
+<script src="/assets/echarts.min.js?v=58"></script>
+<script src="/assets/app.js?v=58"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };

@@ -123,7 +123,8 @@ main { flex: 1; padding: 16px 20px; display: flex; flex-direction: column; gap: 
   background: #1a2530; border: 1px solid #263545; border-radius: 8px;
   padding: 10px 14px; font-size: 12px; color: #b0bec5; line-height: 1.8;
   text-align: left; box-shadow: 0 4px 16px rgba(0,0,0,.5);
-  white-space: nowrap; display: none;
+  /* v58（口径说明）：nowrap 会让长口径行撑破窄屏，改 normal + 上限宽，长行自然折行 */
+  white-space: normal; max-width: min(420px, 80vw); display: none;
 }
 .hint-card.show { display: block; }
 .hint-card b { color: #4fc3f7; font-weight: 600; }

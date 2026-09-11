@@ -97,6 +97,17 @@
   // 线用 DOM 元素画（独立于 ECharts），坐标换算失败时按像素比例兜底。
   var _pinCharts = [];
   var _pinIdx = null;
+  // v58（性能/所见=所报）：降采样与缓存状态
+  //   _dispIdx：降采样显示索引（null=全量）——renderAll 对长报告抽稀后置入，pin/缩放按显示索引换算
+  //   _catTimes：缓存类目轴数据，替代点击/定位时的 chart.getOption() 全量深拷贝
+  //   _totalDurSec/_zoomWindowSec：缩放窗口时长（秒），替代 axisLabel formatter 里的 getOption().dataZoom
+  var _dispIdx = null;
+  var _catTimes = [];
+  var _totalDurSec = 0;
+  var _zoomWindowSec = null;   // null=全范围
+  var _pinWindowVisible = true;   // 锁定点当前是否在缩放窗口内
+  // 长报告降采样阈值：超过此点数的报告，显示类目/系列数据等距抽稀到该点数（统计仍全量）
+  var DISP_MAX_POINTS = 3000;
 
   // v43：判断容器内坐标 (x,y) 是否落在 legend（右上角"自选数据"）区域。
   //
@@ -204,25 +215,28 @@
 
   function _pinIndexAtLocal(chart, dom, x, y) {
     // x/y 为容器内坐标（v42 前用 clientX-rect.left，本质相同）
+    // v58：用缓存的 _catTimes（显示类目）替代 getOption() 深拷贝
     try {
       var pt = chart.convertFromPixel({ xAxisIndex: 0 }, [x, y]);
       if (pt && typeof pt[0] === 'number' && isFinite(pt[0])) {
         var idx = Math.round(pt[0]);
-        var cats = ((chart.getOption().xAxis || [{}])[0] || {}).data || [];
-        if (cats.length) return Math.max(0, Math.min(idx, cats.length - 1));
+        if (_catTimes.length) return Math.max(0, Math.min(idx, _catTimes.length - 1));
         return idx;
       }
     } catch (e) {}
     // 比例兜底：类目大致均匀分布
     var r = dom.getBoundingClientRect();
-    var cats2 = ((chart.getOption().xAxis || [{}])[0] || {}).data || [];
-    if (!cats2.length || r.width <= 0) return null;
-    var idx2 = Math.round(x / r.width * cats2.length);
-    return Math.max(0, Math.min(idx2, cats2.length - 1));
+    if (!_catTimes.length || r.width <= 0) return null;
+    var idx2 = Math.round(x / r.width * _catTimes.length);
+    return Math.max(0, Math.min(idx2, _catTimes.length - 1));
   }
+
+  // v58：显示索引 → 全量索引（降采样后 _pinRows 仍为全量，快照取数需换算）
+  function _pinFullIdx(idx) { return _dispIdx ? _dispIdx[idx] : idx; }
 
   function _pinLockAll(idx, pxX) {
     _pinIdx = idx;
+    _pinWindowVisible = true;   // 锁定时默认在窗口内（随后缩放时由 _refreshPinAfterZoom 更新）
     var localX = (typeof pxX === 'number' && isFinite(pxX)) ? pxX : null;
     _pinCharts.forEach(function (c) {
       if (!c) return;
@@ -244,7 +258,7 @@
       }
     });
     _pinShowData(idx, localX);   // 蓝线位置显示该模块 tooltip 风格数据浮层
-    _pinNotify(_buildPinSnapshot(_pinRows[idx]));   // v52（需求 B）：锁定 → 通知快照条显示
+    _pinNotify(_buildPinSnapshot(_pinRows[_pinFullIdx(idx)]));   // v52（需求 B）：锁定 → 通知快照条显示
   }
 
   // 锁定时刻各模块数据浮层（仿 tooltip 样式，DOM 实现，独立于 ECharts tooltip 不与白线冲突）
@@ -333,7 +347,7 @@
     return { t: t, groups: groups, text: groups.map(function (g) { return g.text; }).join(' · ') };
   }
   function _pinShowData(idx, localX) {
-    var row = _pinRows[idx];
+    var row = _pinRows[_pinFullIdx(idx)];   // v58：显示索引 → 全量行
     if (!row) return;
     _pinCharts.forEach(function (c) {
       if (!c) return;
@@ -371,17 +385,29 @@
       }
       tip.textContent = 't=' + t + '\n' + fn(row);
       tip.style.display = 'block';
-      // 浮层定位：跟随蓝线像素 x，右缘溢出时翻转到线左侧
-      var w = dom.clientWidth || dom.getBoundingClientRect().width;
-      var x = (typeof localX === 'number' && isFinite(localX)) ? Math.round(localX) : null;
-      if (x === null) {
-        try { x = Math.round(w * (idx + 0.5) / (_pinRows.length || 1)); } catch (e) { x = 0; }
-      }
-      var tw = tip.offsetWidth || 150;
-      var left = x + 10;
-      if (left + tw > w - 4) left = Math.max(4, x - tw - 10);
-      tip.style.left = left + 'px';
+      _pinPlaceTip(c, tip, idx, localX);   // v58：抽成独立函数，缩放后复用重定位
     });
+  }
+
+  // 浮层定位：跟随蓝线像素 x（优先点击像素 localX，否则 convertToPixel 换算），右缘溢出翻转到线左侧
+  function _pinPlaceTip(chart, tip, idx, localX) {
+    var dom = chart.getDom();
+    var w = dom.clientWidth || dom.getBoundingClientRect().width;
+    var x = (typeof localX === 'number' && isFinite(localX)) ? Math.round(localX) : null;
+    if (x === null) {
+      try {
+        var px = chart.convertToPixel({ xAxisIndex: 0 }, idx);
+        if (typeof px === 'number' && isFinite(px)) x = px;
+      } catch (e) {}
+    }
+    if (x === null) {
+      var n = _catTimes.length || 1;   // v58：用缓存类目数，避免 getOption
+      try { x = Math.round(w * (idx + 0.5) / n); } catch (e) { x = 0; }
+    }
+    var tw = tip.offsetWidth || 150;
+    var left = x + 10;
+    if (left + tw > w - 4) left = Math.max(4, x - tw - 10);
+    tip.style.left = left + 'px';
   }
 
   function _pinPlaceLine(chart, line, idx) {
@@ -391,15 +417,16 @@
       if (typeof px === 'number' && isFinite(px)) x = px;
     } catch (e) {}
     if (x === null) {
-      var cats = ((chart.getOption().xAxis || [{}])[0] || {}).data || [];
+      var n = _catTimes.length || 1;   // v58：用缓存类目数，避免 getOption
       var r = chart.getDom().getBoundingClientRect();
-      x = Math.round((idx + 0.5) / (cats.length || 1) * r.width);
+      x = Math.round((idx + 0.5) / n * r.width);
     }
     line.style.left = (x | 0) + 'px';
   }
 
   function _pinUnlockAll() {
     _pinIdx = null;
+    _pinWindowVisible = true;   // v58：解锁复位窗口状态
     document.querySelectorAll('.pin-line').forEach(function (l) { l.style.left = '-9999px'; });
     document.querySelectorAll('.pin-tip').forEach(function (tip) { tip.style.display = 'none'; });
     document.querySelectorAll('.pin-data').forEach(function (pd) { pd.style.display = 'none'; });
@@ -612,6 +639,8 @@
   }
 
   function _applyZoom() {
+    // v58：缩放窗口时长（秒）——供 axisLabel formatter 判断刻度精度，替代 getOption().dataZoom
+    _zoomWindowSec = (_dz.end - _dz.start) / 100 * _totalDurSec;
     _dz.charts.forEach(function (c) {
       try {
         // animation:false → 缩放无过渡动画，拖动即时生效不滞后（v29）
@@ -619,6 +648,44 @@
                            start: _dz.start, end: _dz.end, animation: false });
       } catch (e) {}
     });
+    _refreshPinAfterZoom();   // v58（任务1）：缩放/平移后重算锁定蓝线位置，所见=所报
+  }
+
+  // v58（任务1）：缩放/平移后按当前视图重定位锁定蓝线/浮层；锁定点被窗口排除则隐藏线、
+  // 快照条标注"窗口外"。数据仍取锁定时刻 _pinRows[_pinFullIdx(_pinIdx)]，语义不变。
+  function _refreshPinAfterZoom() {
+    if (_pinIdx === null) return;
+    var n = _dispIdx ? _dispIdx.length : _pinRows.length;
+    if (!n) return;
+    // dataZoom 为百分比窗口 → 换算可见类目索引范围（近似，边界 1 点误差可接受）
+    var startIdx = Math.floor(_dz.start / 100 * n);
+    var endIdx = Math.ceil(_dz.end / 100 * n) - 1;
+    if (endIdx < startIdx) endIdx = startIdx;
+    var visible = _pinIdx >= startIdx && _pinIdx <= endIdx;
+    _pinCharts.forEach(function (c) {
+      if (!c) return;
+      var dom = c.getDom();
+      var line = dom.querySelector('.pin-line');
+      if (line) {
+        if (visible) { _pinPlaceLine(c, line, _pinIdx); line.style.display = ''; }
+        else line.style.left = '-9999px';   // 窗口外 → 隐藏蓝线
+      }
+      var tip = dom.querySelector('.pin-tip');
+      if (tip) {
+        if (visible) { tip.style.display = 'block'; _pinPlaceTip(c, tip, _pinIdx, null); }
+        else tip.style.display = 'none';
+      }
+    });
+    // 仅在"可见↔窗口外"状态翻转时重通知快照条（避免拖动每帧重建 DOM）
+    if (visible !== _pinWindowVisible) {
+      _pinWindowVisible = visible;
+      var snap = _buildPinSnapshot(_pinRows[_pinFullIdx(_pinIdx)]);
+      if (snap && !visible) {
+        snap.groups = snap.groups.concat([{ name: '', text: '⚠ 锁定点已在当前缩放窗口外（数据仍为锁定时刻）' }]);
+        snap.text = snap.text + ' · 窗口外';
+      }
+      _pinNotify(snap);
+    }
   }
 
   function clearTimeSliders() {
@@ -727,10 +794,31 @@
     return parts.join(' · ');
   }
 
-  function timeAxis(rows) {
+  function timeAxis(rows, idxArr) {
+    if (idxArr) {
+      return idxArr.map(function (i) { var r = rows[i]; return r && r.t_ms != null ? Math.round(r.t_ms / 100) / 10 : null; });
+    }
     return rows.map(function (r) { return r.t_ms != null ? Math.round(r.t_ms / 100) / 10 : null; });
   }
-  function series(rows, getter) { return rows.map(getter); }
+  // v58：series 支持 idxArr（降采样显示索引）——仅对显示数据抽稀，统计仍走全量
+  function series(rows, getter, idxArr) {
+    if (idxArr) return idxArr.map(function (i) { return getter(rows[i]); });
+    return rows.map(getter);
+  }
+
+  // v58（性能）：等距抽稀——长报告（>max 点）取 max 个显示索引，含首尾点。
+  // 曲线渲染另有 sampling:'lttb'，这里只为减小 setOption 的类目/系列数据体积。
+  function _downsampleIndices(n, max) {
+    if (n <= max) return null;
+    var idx = [];
+    var step = (n - 1) / (max - 1);
+    for (var i = 0; i < max; i++) {
+      var j = Math.round(i * step);
+      if (!idx.length || idx[idx.length - 1] !== j) idx.push(j);
+    }
+    if (idx[idx.length - 1] !== n - 1) idx.push(n - 1);
+    return idx;
+  }
 
   var baseLine = { type: 'line', showSymbol: false, connectNulls: true,
                    lineStyle: { width: 1.6 }, sampling: 'lttb' };
@@ -796,8 +884,10 @@
     return opt;
   }
 
-  function applyTime(charts, rows, elIds) {
-    var times = timeAxis(rows);
+  function applyTime(charts, rows, elIds, idxArr) {
+    var times = timeAxis(rows, idxArr);
+    _catTimes = times;   // v58：缓存类目（供 pin 定位/点击换算，避免 getOption 深拷贝）
+    _totalDurSec = rows.length ? ((rows[rows.length - 1].t_ms || 0) / 1000) : 0;
     elIds.forEach(function (id) {
       var c = charts[id];
       if (!c) return;
@@ -807,16 +897,12 @@
           nameTextStyle: { fontSize: 10 },
           // 刻度精度自适应（2026-08-14）：
           // 未缩放 / 大范围 → 整数秒；拖动底部时间条放大后 → 采集最大精度（0.1s）
+          // v58：span 改读模块级 _zoomWindowSec（_applyZoom 里随缩放更新），
+          // 避免 formatter 每次渲染都 getOption().dataZoom 深拷贝。
           axisLabel: {
             fontSize: 10,
             formatter: function (val) {
-              var span = null;
-              try {
-                var dz = c.getOption().dataZoom;
-                if (dz && dz[0] && typeof dz[0].endValue === 'number') {
-                  span = dz[0].endValue - dz[0].startValue;
-                }
-              } catch (e) {}
+              var span = _zoomWindowSec;
               if (span === null || span >= 40) return Math.round(val) + '';
               return (Math.round(val * 10) / 10) + '';
             },
@@ -828,11 +914,11 @@
   }
 
   // ---------------- 各指标渲染 ----------------
-  function renderFps(chart, rows, zoom) {
-    var fps = series(rows, function (r) { return r.fps ? r.fps.fps : null; });
+  function renderFps(chart, rows, zoom, idxArr) {
+    var fps = series(rows, function (r) { return r.fps ? r.fps.fps : null; }, idxArr);
     var jank = series(rows, function (r) {
       return r.fps && r.fps.jank_rate != null ? r.fps.jank_rate * 100 : null;
-    });
+    }, idxArr);
     // FPS y 轴上限 = 实际数据最高帧率向上取 20 的倍数（不设 120 地板）：
     // 设备能跑多少就显示多少——60Hz 划到 60，120Hz 划到 120，144Hz 划到 160，更高同理
     var top = max(fps) || 60;
@@ -852,10 +938,10 @@
     });
   }
 
-  function renderFrameTime(chart, rows, zoom) {
-    var p50 = series(rows, function (r) { return r.fps ? r.fps.frame_p50_ms : null; });
-    var p95 = series(rows, function (r) { return r.fps ? r.fps.frame_p95_ms : null; });
-    var mx = series(rows, function (r) { return r.fps ? r.fps.frame_max_ms : null; });
+  function renderFrameTime(chart, rows, zoom, idxArr) {
+    var p50 = series(rows, function (r) { return r.fps ? r.fps.frame_p50_ms : null; }, idxArr);
+    var p95 = series(rows, function (r) { return r.fps ? r.fps.frame_p95_ms : null; }, idxArr);
+    var mx = series(rows, function (r) { return r.fps ? r.fps.frame_max_ms : null; }, idxArr);
     chart.setOption({
       ...baseOption(zoom),
       yAxis: { type: 'value', name: 'ms', nameLocation: 'middle', nameGap: 36,
@@ -868,16 +954,16 @@
     });
   }
 
-  function renderCpu(chart, rows, zoom) {
-    var total = series(rows, function (r) { return r.cpu ? r.cpu.cpu_total_pct : null; });
-    var proc = series(rows, function (r) { return r.cpu ? r.cpu.cpu_proc_pct : null; });
+  function renderCpu(chart, rows, zoom, idxArr) {
+    var total = series(rows, function (r) { return r.cpu ? r.cpu.cpu_total_pct : null; }, idxArr);
+    var proc = series(rows, function (r) { return r.cpu ? r.cpu.cpu_proc_pct : null; }, idxArr);
     // v41：进程占整机% = cpu_proc_pct ÷ 核数。核数从 /api/status（实时）或 jsonl
     // meta 行（历史）取得；未知时不渲染该曲线（setCores 未注入 / meta 缺失）。
     var procOfTotal = _cores
       ? series(rows, function (r) {
           var p = r.cpu ? r.cpu.cpu_proc_pct : null;
           return (typeof p === 'number' && isFinite(p)) ? Math.round(p / _cores * 100) / 100 : null;
-        })
+        }, idxArr)
       : null;
     var seriesList = [
       Object.assign({}, baseLine, { name: '整机%', data: total, color: COLORS.cpu_total, lineStyle: { width: 1.6, color: COLORS.cpu_total } }),
@@ -897,13 +983,13 @@
     });
   }
 
-  function renderMem(chart, rows, zoom) {
+  function renderMem(chart, rows, zoom, idxArr) {
     var pss = series(rows, function (r) {
       return r.mem && r.mem.pss_kb != null ? Math.round(r.mem.pss_kb / 1024 * 10) / 10 : null;
-    });
+    }, idxArr);
     var rss = series(rows, function (r) {
       return r.mem && r.mem.vmrss_kb != null ? Math.round(r.mem.vmrss_kb / 1024 * 10) / 10 : null;
-    });
+    }, idxArr);
     chart.setOption({
       ...baseOption(zoom),
       yAxis: { type: 'value', name: 'MB', nameLocation: 'middle', nameGap: 36,
@@ -915,9 +1001,9 @@
     });
   }
 
-  function renderNet(chart, rows, zoom) {
-    var rx = series(rows, function (r) { return r.net ? r.net.rx_kbps : null; });
-    var tx = series(rows, function (r) { return r.net ? r.net.tx_kbps : null; });
+  function renderNet(chart, rows, zoom, idxArr) {
+    var rx = series(rows, function (r) { return r.net ? r.net.rx_kbps : null; }, idxArr);
+    var tx = series(rows, function (r) { return r.net ? r.net.tx_kbps : null; }, idxArr);
     chart.setOption({
       ...baseOption(zoom),
       yAxis: { type: 'value', name: 'KB/s', nameLocation: 'middle', nameGap: 36,
@@ -929,9 +1015,9 @@
     });
   }
 
-  function renderTemp(chart, rows, zoom) {
-    var temp = series(rows, function (r) { return r.therm ? r.therm.temp_c : null; });
-    var power = series(rows, function (r) { return r.therm ? r.therm.power_w : null; });
+  function renderTemp(chart, rows, zoom, idxArr) {
+    var temp = series(rows, function (r) { return r.therm ? r.therm.temp_c : null; }, idxArr);
+    var power = series(rows, function (r) { return r.therm ? r.therm.power_w : null; }, idxArr);
     // v48（UI优化 2.3）：温度下界按数据自适应——原固定 25 在冬天/散热好的机型上
     // 会把曲线截断贴底；取数据最小值-2，无数据回退 25
     var tMin = min(temp);
@@ -965,6 +1051,9 @@
   function renderAll(charts, rows, opts) {
     var zoom = !!(opts && opts.zoom);
     if (!rows.length) return;
+    // v58（性能）：长报告降采样——仅对显示数据（类目/系列输入）抽稀，统计仍走全量
+    _dispIdx = _downsampleIndices(rows.length, DISP_MAX_POINTS);
+    var idxArr = _dispIdx;
     // 无数据指标自动隐藏对应卡片。
     // hasData 用 typeof number 判断（合法 0 值——静止 FPS/空载 CPU——不会隐藏卡片；
     // 2026-08-21 复核：getter 显式返回 null 代替 && 短路，语义等价且更清晰）
@@ -982,14 +1071,14 @@
     setCardVisible('chart-net', netVisible);
     setCardVisible('chart-temp', tempVisible);
 
-    if (fpsVisible && charts.fps) renderFps(charts.fps, rows, zoom);
-    if (frameVisible && charts.frametime) renderFrameTime(charts.frametime, rows, zoom);
-    if (cpuVisible && charts.cpu) renderCpu(charts.cpu, rows, zoom);
-    if (memVisible && charts.mem) renderMem(charts.mem, rows, zoom);
-    if (netVisible && charts.net) renderNet(charts.net, rows, zoom);
-    if (tempVisible && charts.temp) renderTemp(charts.temp, rows, zoom);
+    if (fpsVisible && charts.fps) renderFps(charts.fps, rows, zoom, idxArr);
+    if (frameVisible && charts.frametime) renderFrameTime(charts.frametime, rows, zoom, idxArr);
+    if (cpuVisible && charts.cpu) renderCpu(charts.cpu, rows, zoom, idxArr);
+    if (memVisible && charts.mem) renderMem(charts.mem, rows, zoom, idxArr);
+    if (netVisible && charts.net) renderNet(charts.net, rows, zoom, idxArr);
+    if (tempVisible && charts.temp) renderTemp(charts.temp, rows, zoom, idxArr);
 
-    applyTime(charts, rows, ['fps', 'frametime', 'cpu', 'mem', 'net', 'temp']);
+    applyTime(charts, rows, ['fps', 'frametime', 'cpu', 'mem', 'net', 'temp'], idxArr);
 
     // 关键：渲染后强制 resize，按当前容器实际宽度铺满（容器从隐藏转显示 / 窗口变化时
     // 若不 resize，echarts 会沿用旧宽度导致曲线只占左半边、右侧空白）
@@ -1096,8 +1185,8 @@
     el.innerHTML =
       // 核心 KPI 置顶（大卡 + 阈值着色）——第一眼回答"这次测得好不好"
       build('平均帧率', fmt(stats.fps_avg, 1), '/ 满帧 ' + hz, fpsGrade(stats.fps_avg), true) +
-      build('卡顿率', fmt(stats.jank_avg, 2), '%', jankGrade(stats.jank_avg), true) +
-      build('帧时间 P95', fmt(stats.ft_p95_avg, 1), 'ms', ftGrade(stats.ft_p95_avg), true) +
+      build('卡顿率（均值）', fmt(stats.jank_avg, 2), '%', jankGrade(stats.jank_avg), true) +
+      build('帧时间 P95（均值）', fmt(stats.ft_p95_avg, 1), 'ms', ftGrade(stats.ft_p95_avg), true) +
       // 次要指标
       build('最低帧率(除静止)', fmt(fpsMinActive, 1), 'FPS') +
       build('P95 帧率', fmt(stats.fps_p95, 1), 'FPS') +
