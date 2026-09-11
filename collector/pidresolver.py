@@ -16,7 +16,8 @@ import time
 
 
 class PidResolver:
-    def __init__(self, adb, package, process_pattern="appbrand"):
+    def __init__(self, adb, package, process_pattern="appbrand",
+                 fixed_pid=None, fixed_name=None):
         self.adb = adb
         self.package = package
         self.process_pattern = process_pattern
@@ -28,6 +29,14 @@ class PidResolver:
         # 校验优先走 /proc/<pid>/cmdline 完整进程名比对（不受 comm 15 字符截断
         # 影响，见 _identity_ok），comm 仅作 cmdline 读取失败时的回退。
         self._expect = process_pattern or package.rsplit(".", 1)[-1]
+        # "用户指定进程"模式（2026-09-11 启动向导）：用户在探测列表里选定 pid，
+        # 之后**不再自动改选**——进程消失就返回 None（指标缺数、页面告警），
+        # 而不是静默切到另一个 appbrand 造成"同一份数据前后不同进程"的脏数据。
+        self._fixed_pid = fixed_pid
+        self._fixed_name = fixed_name
+        if fixed_pid:
+            self.pid = fixed_pid
+            self.proc_name = fixed_name
 
     def resolve(self):
         """重新解析目标进程 pid，找不到返回 None（带 5s 失败节流）。
@@ -38,6 +47,21 @@ class PidResolver:
         （实测 1476s）；旧逻辑取 ps 列表第一个（pid 最小）会采到闲置进程，
         导致 cpu/mem/net 全部采错进程（8/27 数据作废事故）。
         """
+        # 用户指定进程模式（2026-09-11）：只确认该 pid 仍存在、身份未变，
+        # **绝不自动改选其他 appbrand**——自动改选会在切换前先采一段错进程数据。
+        if self._fixed_pid:
+            try:
+                pids = self._list_pids()
+            except Exception:
+                pids = []
+            for p, name in pids:
+                if p == self._fixed_pid:
+                    self.pid = p
+                    self.proc_name = name or self._fixed_name
+                    return p
+            self.pid = None
+            self.proc_name = None
+            return None
         # 失败节流：上次解析失败后 5s 内不再重复打命令（3 个采集线程共享实例，
         # 不加节流会以 ~3次/s 高频轰炸 adb）
         if self.pid is None and time.time() < self._next_check:
@@ -180,6 +204,10 @@ class PidResolver:
             self._next_check = ts + self._check_interval
             if self._identity_ok(self.pid):
                 return self.pid
-            # 身份不匹配 / 读取失败：pid 已失效或被复用，重新解析
+            # 身份不匹配 / 读取失败：pid 已失效或被复用
             self.pid = None
+            if self._fixed_pid:
+                # 用户指定进程模式：失效即停采该目标（指标缺数、页面可告警），
+                # 不自动改选——避免"同一份数据前后不同进程"的静默脏数据
+                return None
         return self.resolve()

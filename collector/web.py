@@ -98,8 +98,10 @@ def trim_report_cache(cache, points, max_entries, max_points):
 
 
 class WebServer:
-    def __init__(self, port=8080, output_dir="output", adb=None, switch_cb=None):
+    def __init__(self, port=8080, output_dir="output", adb=None, switch_cb=None,
+                 process_pattern="appbrand"):
         self.port = port
+        self.process_pattern = process_pattern   # 启动向导探测用（如 appbrand）
         self.output_dir = os.path.abspath(output_dir)
         self.latest = []            # 环形缓冲
         self._seq = 0               # 采样序号：SSE 用它作增量游标（替代 count）
@@ -149,6 +151,12 @@ class WebServer:
         # 不加锁仍可能读到不一致状态；加锁同时让同一报告的并发请求串行命中缓存，
         # 避免重复全文解析
         self._report_lock = threading.Lock()
+        # ---- 启动向导（2026-09-11）----
+        # 探测缓存（TTL 8s）：探测需多次 adb 往返 + ~0.8s 增量采样，避免连点"刷新探测"打爆设备
+        self._probe_cache = (0.0, None)
+        self._probe_lock = threading.Lock()
+        # 用户"开始采集"请求：/api/start 写入，main.py 用 take_start_request() 轮询取走
+        self._start_req = None
 
     # ---------------- 采集器调用 ----------------
     def add_sample(self, row):
@@ -162,6 +170,54 @@ class WebServer:
     def set_status(self, **kw):
         with self._lock:
             self.status.update(kw)
+
+    # ---------------- 启动向导（2026-09-11）----------------
+    # 设计：探测只读、不写任何采集数据；用户在看板上选定进程后 /api/start 记录请求，
+    # main.py 轮询 take_start_request() 取走后**才开始创建 jsonl 并采样**——避免"先采
+    # 了错进程再切"造成脏数据（2026-09-11 真机事故：采到 appbrand0 而非游戏的 appbrand1）。
+    def probe_candidates(self, force=False):
+        """探测微信候选进程（只读）。TTL 8s 缓存；返回 probe.probe_once 的结果结构。"""
+        now = time.time()
+        with self._probe_lock:
+            ts, cached = self._probe_cache
+            if not force and cached is not None and (now - ts) < 8.0:
+                return cached
+        if not self.adb:
+            res = {"ok": False, "error": "看板未连接采集器（离线模式无法探测进程）",
+                   "candidates": [], "layer": {"name": None, "appbrand_index": None}}
+        else:
+            try:
+                from probe import probe_once
+                res = probe_once(self.adb, self.process_pattern)
+            except Exception as e:
+                res = {"ok": False, "error": f"探测失败: {e}", "candidates": [],
+                       "layer": {"name": None, "appbrand_index": None}}
+        with self._probe_lock:
+            self._probe_cache = (time.time(), res)
+        return res
+
+    def request_start(self, pid):
+        """校验 pid 在当前候选中 → 记录"开始采集"请求。返回 (ok, error)。"""
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False, "pid 非法"
+        res = self.probe_candidates(force=False)
+        cands = {c.get("pid"): c for c in (res.get("candidates") or [])}
+        if not cands:
+            return False, res.get("error") or "没有可用的候选进程（请先刷新探测）"
+        if pid not in cands:
+            return False, f"pid {pid} 不在当前候选列表中（请刷新探测后重新选择）"
+        with self._lock:
+            self._start_req = {"pid": pid, "name": cands[pid].get("name"),
+                               "ts": time.time()}
+        return True, None
+
+    def take_start_request(self):
+        """取走"开始采集"请求（main.py 轮询用）；无请求返回 None。"""
+        with self._lock:
+            req, self._start_req = self._start_req, None
+            return req
 
     def set_switch_callback(self, cb):
         """注入热切换回调（main.py 传入 apply_target）。"""
@@ -446,6 +502,11 @@ class WebServer:
                 elif path == "/api/stream":
                     # SSE 实时推送：采集到新样本即推，毫秒级响应（二期增强 2026-08-14）
                     self._sse(server)
+                elif path == "/api/candidates":
+                    # 启动向导（2026-09-11）：列出候选进程 + 推荐（只读探测，不写采集数据）
+                    qs = parse_qs(parsed.query)
+                    force = (qs.get("force") or [""])[0] in ("1", "true")
+                    self._send_json_api(lambda: server.probe_candidates(force=force))
                 elif path == "/api/runs":
                     # 统一兜底：内部异常 → 200+{"error"}，不让线程崩溃重置连接
                     self._send_json_api(self._list_runs)
@@ -486,7 +547,16 @@ class WebServer:
                     return
                 parsed = urlparse(self.path)
                 qs = parse_qs(parsed.query)
-                if parsed.path == "/api/rename":
+                if parsed.path == "/api/start":
+                    # 启动向导（2026-09-11）：用户选定进程后请求开始采集；
+                    # main.py 轮询 take_start_request() 取走 → 创建 jsonl 并启动采样。
+                    qs2 = parse_qs(parsed.query)
+                    ok, err = server.request_start((qs2.get("pid") or [""])[0])
+                    self._send(200, json.dumps(
+                        {"ok": ok, "error": None if ok else err,
+                         "message": "已开始采集" if ok else None},
+                        ensure_ascii=False))
+                elif parsed.path == "/api/rename":
                     name = (qs.get("name") or [""])[0]
                     newname = (qs.get("newname") or [""])[0]
                     ok, err = self._rename_run(name, newname)

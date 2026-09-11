@@ -13,6 +13,7 @@
 import argparse
 import json
 import os
+import queue
 import signal
 import sys
 import threading
@@ -84,6 +85,8 @@ def main():
     ap.add_argument("--port", type=int, default=8080, help="Web 看板端口（默认 8080）")
     ap.add_argument("--no-browser", action="store_true",
                     help="启动看板后不自动打开浏览器（无头/CI 场景用）")
+    ap.add_argument("--auto", action="store_true",
+                    help="跳过启动向导：自动解析目标进程并立即开始采集（旧行为/脚本用）")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -117,12 +120,157 @@ def main():
             print(f"[-] 获取前台窗口失败: {e}")
         sys.exit(0)
 
-    resolver = PidResolver(adb, package, process_pattern)
-    pid = resolver.resolve()
-    if pid:
-        print(f"[+] 目标进程: {package}（匹配 {process_pattern or '主进程'}） pid={pid}")
+    # 停止标志：Ctrl+C / 看板"停止采集"按钮（POST /api/stop）共用同一路径
+    # （复用首次 Ctrl+C 的完整停止逻辑：退采样循环 → 停 logcat → 生成报告 → running=False）
+    stop = {"flag": False}
+    # 看板"退出程序"（POST /api/shutdown）：停止采集后跳过"看板仍在运行"等待，直接结束进程
+    shutdown_req = {"flag": False}
+
+    # ---------------- 启动向导（2026-09-11）：先探测、用户确认后才开始记录 ----------------
+    # 背景：微信可同时存在 appbrand0/1/2 三个实例，自动选进程曾两次采到闲置实例
+    # （2026-09-11 实测：采到 appbrand0 PSS 231MB / CPU 增量近 0，而游戏实际在
+    # appbrand1：PSS 1035MB；FPS 层名 AppBrandUI1 与进程 appbrand0 不匹配）。
+    # 新流程：探测（只读，**不创建任何采集输出**）→ 网页列出候选与推荐 → 用户选定
+    # → 才创建 jsonl 并开始采样。命令行 --auto（或不带 --web）保持旧的自动解析行为。
+    wizard = bool(args.web and not args.auto)
+
+    web = None
+    if args.web:
+        from web import WebServer
+        web = WebServer(port=args.port, output_dir=outdir, adb=adb,
+                        process_pattern=process_pattern)
+        port = web.start()
+        # 启动指引（exe 版没有 bat 的说明文字，关键信息必须在这里讲清楚）：
+        # 看板地址 / 历史报告地址 / 数据目录绝对路径 / 如何开始与停止
+        print("")
+        print("=" * 60)
+        print("  PerfDog-CN 看板已启动")
+        open_hint = "（即将自动打开浏览器）" if not args.no_browser else ""
+        print(f"  实时看板  : http://localhost:{port}  {open_hint}".rstrip())
+        print(f"  历史报告  : http://localhost:{port}/report.html")
+        print(f"  数据目录  : {os.path.abspath(outdir)}")
+        if wizard:
+            print("  采集流程  : ① 网页上选择目标进程 ② 点「开始采集」→ 才开始记录数据")
+        else:
+            print("  停止方式  : 本窗口按 Ctrl+C 一次停采集，再按一次退出")
+        print("=" * 60)
+        print("")
+        if not args.no_browser:
+            # 延迟打开：等服务线程就绪（start() 已绑定端口，稍等更稳妥）
+            def _open_browser():
+                time.sleep(1.5)
+                try:
+                    webbrowser.open(f"http://localhost:{port}")
+                except Exception:
+                    pass
+            threading.Thread(target=_open_browser, daemon=True,
+                             name="open-browser").start()
+
+    chosen_pid, chosen_name = None, None
+    if wizard:
+        from probe import probe_once
+        print("[*] 正在探测微信候选进程（只读，不记录任何采集数据）…", flush=True)
+        probe_info = probe_once(adb, process_pattern)
+        if probe_info.get("ok"):
+            layer = probe_info.get("layer") or {}
+            print("[+] 候选进程（网页上可选择，★为推荐）：")
+            for c in probe_info["candidates"]:
+                mark = " ★推荐" if c.get("recommended") else ""
+                print(f"    pid={c['pid']:<7} {c['name']:<30} 内存 {c['rss_mb']}MB  "
+                      f"CPU增量 {c['cpu_delta_pct']}%{mark}")
+            if layer.get("name"):
+                print(f"[+] 游戏渲染层: {layer['name']}"
+                      f"（AppBrandUI{layer.get('appbrand_index')}）")
+            print(f"[+] 推荐: pid={probe_info.get('recommended_pid')}"
+                  f"（{probe_info.get('recommend_detail')}）")
+        else:
+            print(f"[!] 探测未成功: {probe_info.get('error')}")
+        if web:
+            web.set_status(phase="waiting", candidates=probe_info,
+                           device=adb.serial, target=package,
+                           process_pattern=process_pattern)
+        print("[*] 网页上选择目标进程 → 点「开始采集」；也可直接在本窗口按回车（用推荐项）"
+              "或输入 pid 后回车；命令行 --auto 可跳过向导")
+        # 终端兜底输入（网页界面做好之前的可用路径）：后台线程读一行，主循环轮询
+        _in_q = queue.Queue()
+
+        def _stdin_reader():
+            try:
+                _in_q.put(input())
+            except Exception:
+                pass
+
+        threading.Thread(target=_stdin_reader, daemon=True, name="stdin-reader").start()
+        _last_wait_log = 0.0
+        while not stop["flag"]:
+            req = web.take_start_request() if web else None
+            if req:
+                chosen_pid = req.get("pid")
+                chosen_name = req.get("name")
+                print(f"[>] 收到开始指令（网页）: pid={chosen_pid} {chosen_name}", flush=True)
+                break
+            try:
+                line = (_in_q.get_nowait() or "").strip()
+            except queue.Empty:
+                line = None
+            if line is not None:
+                if line == "":
+                    rec = (probe_info or {}).get("recommended_pid")
+                    if rec:
+                        chosen_pid = rec
+                        for c in (probe_info or {}).get("candidates", []):
+                            if c["pid"] == rec:
+                                chosen_name = c["name"]
+                                break
+                        print(f"[>] 回车确认 → 使用推荐 pid={chosen_pid} {chosen_name}", flush=True)
+                        break
+                    print("[!] 无推荐项可用，请在网页上选择（或输入 pid）", flush=True)
+                elif line.isdigit():
+                    chosen_pid = int(line)
+                    for c in (probe_info or {}).get("candidates", []):
+                        if c["pid"] == chosen_pid:
+                            chosen_name = c["name"]
+                            break
+                    print(f"[>] 已选定 pid={chosen_pid} {chosen_name}", flush=True)
+                    break
+                elif line:
+                    print(f"[!] 无法识别输入 {line!r}：回车用推荐项，或输入候选 pid", flush=True)
+                threading.Thread(target=_stdin_reader, daemon=True,
+                                 name="stdin-reader").start()
+            if time.time() - _last_wait_log > 30:
+                _last_wait_log = time.time()
+                print("[*] 仍在等待「开始采集」…（网页点按钮 / 本窗口回车 / Ctrl+C 退出）",
+                      flush=True)
+            time.sleep(0.3)
+        if stop["flag"]:
+            print("[=] 已取消，未创建任何采集数据。")
+            if web:
+                web.stop()
+            return
+        if not chosen_pid:
+            # 理论上 /api/start 会带 pid；这里兜底用推荐项，避免"开始了却没有目标"
+            rec = (probe_info or {}).get("recommended_pid")
+            if rec:
+                chosen_pid = rec
+                for c in (probe_info or {}).get("candidates", []):
+                    if c["pid"] == rec:
+                        chosen_name = c["name"]
+                        break
+                print(f"[!] 未指定进程，回退到推荐 pid={chosen_pid}")
+
+    # 目标进程：向导模式用用户选定的 pid（固定，不再自动改选）；否则旧行为自动解析
+    if chosen_pid:
+        resolver = PidResolver(adb, package, process_pattern,
+                               fixed_pid=chosen_pid, fixed_name=chosen_name)
+        pid = resolver.resolve()
+        print(f"[+] 目标进程（用户指定）: {chosen_name or package} pid={pid}")
     else:
-        print(f"[!] 未找到 {package} 的进程，请确认小游戏已打开且在前台。")
+        resolver = PidResolver(adb, package, process_pattern)
+        pid = resolver.resolve()
+        if pid:
+            print(f"[+] 目标进程: {package}（匹配 {process_pattern or '主进程'}） pid={pid}")
+        else:
+            print(f"[!] 未找到 {package} 的进程，请确认小游戏已打开且在前台。")
 
     fps = FpsCollector(adb, package, process_pattern)
     cpu = CpuCollector(adb, resolver)
@@ -165,44 +313,15 @@ def main():
             monitor = None
             print(f"[!] logcat 监听启动失败（不影响性能采集）: {e}")
 
-    # 停止标志：Ctrl+C / 看板"停止采集"按钮（POST /api/stop）共用同一路径
-    # （复用首次 Ctrl+C 的完整停止逻辑：退采样循环 → 停 logcat → 生成报告 → running=False）
-    stop = {"flag": False}
-    # 看板"退出程序"（POST /api/shutdown）：停止采集后跳过"看板仍在运行"等待，直接结束进程
-    shutdown_req = {"flag": False}
-
-    # 可选：实时 Web 看板
-    web = None
-    if args.web:
-        from web import WebServer
-        web = WebServer(port=args.port, output_dir=outdir, adb=adb)
-        port = web.start()
-        # 启动指引（exe 版没有 bat 的说明文字，关键信息必须在这里讲清楚）：
-        # 看板地址 / 历史报告地址 / 数据目录绝对路径 / 如何停止
-        print("")
-        print("=" * 60)
-        print("  PerfDog-CN 实时看板已启动")
-        open_hint = "（即将自动打开浏览器）" if not args.no_browser else ""
-        print(f"  实时看板  : http://localhost:{port}  {open_hint}".rstrip())
-        print(f"  历史报告  : http://localhost:{port}/report.html")
-        print(f"  数据目录  : {os.path.abspath(outdir)}")
-        print("  停止方式  : 本窗口按 Ctrl+C 一次停采集，再按一次退出")
-        print("=" * 60)
-        print("")
-        if not args.no_browser:
-            # 延迟打开：等服务线程就绪（start() 已绑定端口，稍等更稳妥）
-            def _open_browser():
-                time.sleep(1.5)
-                try:
-                    webbrowser.open(f"http://localhost:{port}")
-                except Exception:
-                    pass
-            threading.Thread(target=_open_browser, daemon=True,
-                             name="open-browser").start()
+    # 实时 Web 看板：服务启动与"打开浏览器"已在启动向导阶段提前完成，
+    # 这里只在**用户确认、采集真正开始后**更新状态——向导模式下此前不产生任何输出文件。
+    if web:
         web.set_status(running=True, device=adb.serial, pid=pid, run_id=run_id,
                        target=package, process_pattern=process_pattern,
                        cores=cores, device_info=device_info,
-                       started_at=datetime.now().strftime("%H:%M:%S"))
+                       started_at=datetime.now().strftime("%H:%M:%S"),
+                       phase="running",
+                       target_source=("user" if chosen_pid else "auto"))
 
         # ---- 看板下拉"切换被测应用"回调（方案 A 2026-08-20） ----
         # 热切换：不重启进程，重建绑定目标进程的采集器即可；下一次采样自动走新目标。
@@ -318,6 +437,9 @@ def main():
     # 数据健全性实时自检（2026-08-27）：每轮对当前快照跑轻量规则，连续命中才告警，
     # 复用断连告警的"连续 N 轮才提醒"思路，避免单点噪声刷屏
     health_streak = {}
+    # 目标一致性自检状态（2026-09-11）：层 AppBrandUI(n) 与采集进程 appbrand(n) 比对
+    last_mismatch_check = 0.0
+    mismatch_state = {"msg": None}
     with open(out_file, "w", encoding="utf-8") as f:
         # meta 行（2026-08-26）：首行写入核数等采集元信息，供历史报告读取核数，
         # 不依赖当前是否连接设备。event 行不参与采样点统计（前端 prepareRows 过滤）。
@@ -367,6 +489,46 @@ def main():
             health_alerts, health_streak = check_rows_live(row, health_streak)
             for msg in health_alerts:
                 print(f"[!] 数据健全性告警: {msg}", flush=True)
+
+            # 目标一致性自检（2026-09-11，随启动向导引入）：FPS 层名里的 AppBrandUI(n)
+            # 应与正在采集的 appbrand(n) 一致；不一致说明微信把渲染切到了别的实例
+            # （此时 cpu/mem/net 采的是错进程）。**不自动切换**——切换前必然先采一段
+            # 错数据；这里只写事件行 + 页面告警，由用户决定"停止重选/继续"。
+            if chosen_pid and (time.time() - last_mismatch_check >= 5.0):
+                last_mismatch_check = time.time()
+                try:
+                    from probe import pick_game_layer, appbrand_index, layer_appbrand_index
+                    lname, lidx = pick_game_layer(
+                        adb.shell(["dumpsys", "SurfaceFlinger", "--list"]))
+                    pidx = appbrand_index(resolver.proc_name or "")
+                    if lidx is not None and pidx is not None and lidx != pidx:
+                        msg = (f"渲染层 AppBrandUI{lidx} 与采集进程 appbrand{pidx} 不一致"
+                               f"（pid={resolver.pid}）——cpu/内存可能采错进程")
+                        if msg != mismatch_state.get("msg"):
+                            mismatch_state["msg"] = msg
+                            print(f"[!] 目标错配: {msg}", flush=True)
+                            try:
+                                with open(out_file, "a", encoding="utf-8") as mf:
+                                    mf.write(json.dumps({
+                                        "ts": round(time.time(), 3),
+                                        "event": "target_mismatch",
+                                        "layer": lname,
+                                        "layer_index": lidx,
+                                        "pid_index": pidx,
+                                        "pid": resolver.pid,
+                                    }, ensure_ascii=False) + "\n")
+                            except Exception:
+                                pass
+                            if web:
+                                web.set_status(mismatch={"layer": lname, "layer_index": lidx,
+                                                         "pid_index": pidx, "pid": resolver.pid,
+                                                         "message": msg})
+                    elif mismatch_state.get("msg"):
+                        mismatch_state["msg"] = None
+                        if web:
+                            web.set_status(mismatch=None)
+                except Exception:
+                    pass
 
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
