@@ -41,6 +41,17 @@ COLUMNS = [
 ]
 
 
+def script_safe_json(obj, ensure_ascii=True):
+    """json.dumps + 把 `</` 转义为 `<\\/`（2026-09-11）。
+
+    导出报告把数据/事件 JSON 内联进 HTML 的 <script> 标签：logcat 捞到的
+    console 文本、备注、应用名等若含 "</script>"，会截断/注入报告结构
+    （数据来自被测应用，不可控）。`\\/` 是 JSON 合法转义（解析回 "/"），
+    json.loads 与 JS JSON.parse 均无损。
+    """
+    return json.dumps(obj, ensure_ascii=ensure_ascii).replace("</", "<\\/")
+
+
 def load_rows(path):
     rows = []
     with open(path, encoding="utf-8") as f:
@@ -170,7 +181,7 @@ def export_html(rows, out_path, events=None):
     echarts = read(os.path.join(ASSETS_DIR, "echarts.min.js"))
     appjs = read(os.path.join(ASSETS_DIR, "app.js"))
     style = read(os.path.join(ASSETS_DIR, "style.css"))
-    data = json.dumps(rows, ensure_ascii=False)
+    data = script_safe_json(rows, ensure_ascii=False)
     # 自动探测同目录事件文件 <name>.events.jsonl（logcat 标注层）
     if events is None:
         events = []
@@ -189,8 +200,8 @@ def export_html(rows, out_path, events=None):
                             pass
         except Exception:
             pass
-    events_json = json.dumps(events, ensure_ascii=False)
-    cores_json = json.dumps(cores)   # None → "null"，JS 侧 falsy
+    events_json = script_safe_json(events, ensure_ascii=False)
+    cores_json = script_safe_json(cores)   # None → "null"，JS 侧 falsy
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">

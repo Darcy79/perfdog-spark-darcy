@@ -94,8 +94,13 @@ class MemCollector:
             except Exception:
                 pass
 
-        # 2) 回退 dumpsys meminfo（App Summary 同源解析）
-        target = str(pid) if pid else self.package
+        # 2) 回退 dumpsys meminfo（App Summary 同源解析）——仅当有 pid 时。
+        #    pid 为 None（进程消失/解析失败）不得回退包名维度：dumpsys meminfo
+        #    <package> 对多进程应用返回全部进程合计（微信可差一个量级），曲线上
+        #    表现为假突跳（2026-09-11 修复）。宁可缺数，不采错数。
+        if not pid:
+            return result
+        target = str(pid)
         try:
             out = self.adb.shell(["dumpsys", "meminfo", target])
         except Exception:

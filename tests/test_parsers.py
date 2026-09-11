@@ -12,6 +12,7 @@
 
 import os
 import sys
+import json
 import unittest
 
 # 注入 collector 目录到 sys.path（main.py 以 collector 为运行根）
@@ -20,11 +21,11 @@ if _COLLECTOR not in sys.path:
     sys.path.insert(0, _COLLECTOR)
 
 from metrics.fps import FpsCollector, MAX_VALID_TS, _main_segment, FPS_SEGMENT_GAP_NS
-from metrics.mem import parse_smaps_rollup, parse_meminfo
+from metrics.mem import parse_smaps_rollup, parse_meminfo, MemCollector
 from metrics.cpu import CpuCollector
 from metrics.thermal import ThermalCollector
 from pidresolver import PidResolver
-from export_report import COLUMNS, flatten, extract_cores, data_rows
+from export_report import COLUMNS, flatten, extract_cores, data_rows, script_safe_json
 
 
 class MockAdb:
@@ -884,6 +885,232 @@ class TestOppoLayerResolve(unittest.TestCase):
         layer = self._resolve(out)
         self.assertIn("AppBrandUI#622", layer)
         self.assertNotIn("ActivityRecordInputSink", layer)
+
+
+class TestFpsPhysicalClamp(unittest.TestCase):
+    """FPS 物理上限钳制与低帧数告警（2026-09-11）。
+
+    主段仅 2 帧、间隔极近时 (帧数-1)/span 输出非物理值（2 帧相隔 0.5ms → 2000
+    FPS）；修复后钳制到刷新率×1.5（60Hz → 90），并带 fps_clamped / fps_warn
+    标记。正常连续/稀疏缓冲的既有正确值必须保持不变。
+    """
+
+    L = "SurfaceView[com.tencent.mm:appbrand0/AppUI]#776(BLAST)"
+
+    @staticmethod
+    def _latency_from_ts(tss, refresh_ns=16666666):
+        out = f"{refresh_ns}\n"
+        for t in tss:
+            out += f"{t}\t{t}\t{t}\n"
+        return out
+
+    def _collector(self, adb):
+        return FpsCollector(adb, "com.tencent.mm", "appbrand", retry_interval=0.0)
+
+    def test_two_close_frames_clamped(self):
+        # 主段 2 帧、相隔 0.5ms → 裸算 2000 FPS → 钳制到 60Hz×1.5=90 + 双标记
+        t0 = 1_000_000_000_000
+        adb = SfMockAdb(self.L, self._latency_from_ts([t0, t0 + 500_000]))
+        c = self._collector(adb)
+        r = c.sample(1.0)
+        self.assertEqual(r["fps"], 90.0)
+        self.assertTrue(r.get("fps_clamped"))
+        self.assertEqual(r.get("fps_warn"), "low_frames")
+
+    def test_bad_refresh_header_uses_default_cap(self):
+        # 刷新周期行缺失（坏首行）→ 回退默认 60Hz，上限仍是 90
+        t0 = 1_000_000_000_000
+        out = "bad-header\n"
+        for i in range(2):
+            out += f"{t0 + i * 100_000}\t{t0 + i * 100_000}\t{t0 + i * 100_000}\n"
+        adb = SfMockAdb(self.L, out)
+        c = self._collector(adb)
+        r = c.sample(1.0)
+        self.assertEqual(r["fps"], 90.0)      # 裸算 1/0.0001 = 10000 → 钳到 90
+        self.assertTrue(r.get("fps_clamped"))
+        self.assertEqual(r.get("refresh_hz"), 60.0)   # 坏首行 → 默认刷新率，恒为正
+
+    def test_fps_cap_fallback_for_out_of_window_refresh(self):
+        # refresh_ns 超出物理窗口（0.5Hz）→ 兜底上限 240
+        c = FpsCollector.__new__(FpsCollector)
+        c.refresh_ns = 2_000_000_000
+        self.assertEqual(c._fps_cap(), 240.0)
+        c.refresh_ns = 8_333_333
+        self.assertAlmostEqual(c._fps_cap(), 180.0, places=4)   # 120Hz×1.5
+
+    def test_normal_contiguous_no_clamp_no_warn(self):
+        # 荣耀连续缓冲回归保护：60.0 正常值，无钳制无告警
+        adb = SfMockAdb(self.L, sf_latency(1_000_000_000_000, 128, 16_666_666))
+        c = self._collector(adb)
+        r = c.sample(1.0)
+        self.assertEqual(r["fps"], 60.0)
+        self.assertNotIn("fps_clamped", r)
+        self.assertNotIn("fps_warn", r)
+
+    def test_sparse_buffer_main_segment_value_unchanged(self):
+        # OPPO 稀疏缓冲回归保护：主段法 60.0 保持不变
+        step = 16_666_666
+        t0 = 1_000_000_000_000
+        gap_ns = 2_000 * 1_000_000_000
+        tss = [t0] + [t0 + gap_ns + i * step for i in range(127)]
+        adb = SfMockAdb(self.L, self._latency_from_ts(tss))
+        c = self._collector(adb)
+        r = c.sample(1.0)
+        self.assertEqual(r["fps"], 60.0)
+        self.assertNotIn("fps_clamped", r)
+        self.assertNotIn("fps_warn", r)
+
+    def test_real_120fps_stream_not_clamped(self):
+        # 真实 120fps 流：上限 180，正常读数不被误钳
+        tss = [1_000_000_000_000 + i * 8_333_333 for i in range(32)]
+        adb = SfMockAdb(self.L, self._latency_from_ts(tss, refresh_ns=8_333_333))
+        c = self._collector(adb)
+        r = c.sample(1.0)
+        self.assertEqual(r["fps"], 120.0)
+        self.assertNotIn("fps_clamped", r)
+        self.assertNotIn("fps_warn", r)
+
+
+class TestParseLatencyFirstLine(unittest.TestCase):
+    """--latency 刷新周期行改按"首个非空行"判定（2026-09-11）。
+
+    旧实现按物理第 0 行（i==0）判定：输出带前导空行时，刷新周期行落到了
+    数据区 → 16666666 被当成一个"帧时间戳"混入，污染 gaps/FPS。
+    同时刷新周期带物理窗口校验（1ms..1s），异常值不采用（refresh_hz 恒为正）。
+    """
+
+    def test_leading_blank_line_refresh_still_parsed(self):
+        out = "\n16666666\n"
+        for i in range(3):
+            t = 1_000_000_000 + i * 16_666_666
+            out += f"{t}\t{t}\t{t}\n"
+        refresh, ts = FpsCollector._parse_latency(out)
+        self.assertEqual(refresh, 16_666_666)
+        self.assertEqual(len(ts), 3)   # 旧实现会混入 16666666 这个"伪帧"
+
+    def test_refresh_out_of_physical_window_falls_back(self):
+        # 首行数字异常（如 500ns）→ 不采用也不当帧数据，回退默认 60Hz
+        out = "500\n"
+        for i in range(3):
+            t = 1_000_000_000 + i * 16_666_666
+            out += f"{t}\t{t}\t{t}\n"
+        refresh, ts = FpsCollector._parse_latency(out)
+        self.assertEqual(refresh, 16_666_666)
+        self.assertEqual(ts, [1_000_000_000, 1_016_666_666, 1_033_333_332])
+
+    def test_normal_and_bad_first_line_unchanged(self):
+        # 正常输出与坏首行（非数字）行为与旧版完全一致（回归保护）
+        refresh, ts = FpsCollector._parse_latency("16666666\n0\n100\n200\n")
+        self.assertEqual(refresh, 16_666_666)
+        self.assertEqual(ts, [100, 200])
+        refresh, ts = FpsCollector._parse_latency("not-a-number\n0\n100\n200\n")
+        self.assertEqual(refresh, 16_666_666)
+        self.assertEqual(ts, [100, 200])
+
+
+class TestPidResolverIdentity(unittest.TestCase):
+    """pid 身份校验（2026-09-11）：cmdline 优先，comm 截断形态不再误杀。
+
+    真机实测（荣耀 ADT-AN00 / Android 14）：comm = 进程名**末 15 字符**
+    （com.android.systemui → "ndroid.systemui"），appbrand 进程 comm 碰巧含
+    "appbrand"；但标准 Linux 是首 15 截断（→ "com.tencent.mm:"，不含关键字）
+    → 旧校验在这类 ROM 上对正确进程恒失败，每 5s 触发 pid=None + 节流窗口。
+    改为 cmdline（完整进程名）优先、comm 回退的双级校验，两类 ROM 都正确。
+    """
+
+    PS = ("PID ARGS\n"
+          "1417 /system/bin/surfaceflinger\n"
+          "5838 com.tencent.mm:appbrand0\n")
+
+    def _resolver(self, responses):
+        adb = MockAdb(dict(responses, **{"ps -A -o PID,ARGS": self.PS}))
+        r = PidResolver(adb, "com.tencent.mm", "appbrand")
+        self.assertEqual(r.resolve(), 5838)
+        r._next_check = 0
+        return r, adb
+
+    def _ps_calls(self, adb):
+        return [c for c in adb.calls if "ps -A" in " ".join(c)]
+
+    def test_correct_process_truncated_comm_keeps_pid(self):
+        # 进程正确但 comm 不含关键字（首 15 截断 ROM）：cmdline 比对命中 → 不重解析
+        r, adb = self._resolver({
+            "cat /proc/5838/cmdline": "com.tencent.mm:appbrand0\x00",
+            "cat /proc/5838/comm": "com.tencent.mm:\n",   # 标准截断形态
+        })
+        got = r.current_pid(ts=1.0)
+        self.assertEqual(got, 5838)
+        self.assertEqual(len(self._ps_calls(adb)), 1)   # 未触发 re-resolve
+
+    def test_reused_pid_cmdline_mismatch_reresolves(self):
+        # pid 被复用给别的进程：cmdline 可读且不匹配 → 立即 re-resolve
+        # （comm 给"含 appbrand"的干扰值，证明优先走 cmdline、不被 comm 误导）
+        r, adb = self._resolver({
+            "cat /proc/5838/cmdline": "com.android.chrome\x00",
+            "cat /proc/5838/comm": "com.tencent.mm:appbrand0\n",
+        })
+        adb.responses["ps -A -o PID,ARGS"] = \
+            "PID ARGS\n1417 /system/bin/surfaceflinger\n7000 com.tencent.mm:appbrand1\n"
+        got = r.current_pid(ts=1.0)
+        self.assertEqual(got, 7000)
+
+    def test_cmdline_unreadable_falls_back_to_comm(self):
+        # cmdline 读取失败（SELinux/旧内核）→ 回退 comm 包含匹配，不误杀正确进程
+        r, adb = self._resolver({
+            "cat /proc/5838/comm": "com.tencent.mm:appbrand0\n",   # 未截断 ROM
+        })
+        got = r.current_pid(ts=1.0)
+        self.assertEqual(got, 5838)
+        self.assertEqual(len(self._ps_calls(adb)), 1)
+
+    def test_reused_pid_comm_fallback_still_reresolves(self):
+        # cmdline 读失败 + comm 也不匹配（真复用）→ 回退路径同样触发 re-resolve
+        r, adb = self._resolver({
+            "cat /proc/5838/comm": "surfaceflinger\n",
+        })
+        adb.responses["ps -A -o PID,ARGS"] = \
+            "PID ARGS\n1417 /system/bin/surfaceflinger\n7000 com.tencent.mm:appbrand1\n"
+        got = r.current_pid(ts=1.0)
+        self.assertEqual(got, 7000)
+
+
+class TestMemNoPackageFallback(unittest.TestCase):
+    """pid 为 None 时不得回退包名维度（2026-09-11）。
+
+    dumpsys meminfo <package> 对多进程应用返回全部进程合计（微信可差一个
+    量级），曲线上表现为假突跳；pid 缺失时宁可缺数，不采错数。
+    """
+
+    def test_pid_none_returns_empty_without_package_fallback(self):
+        adb = MockAdb({"dumpsys meminfo": "TOTAL PSS: 999999 kB"})   # 若回退包名会被采到
+        c = MemCollector(adb, MockResolver(None), package="com.tencent.mm")
+        r = c.sample(1.0)
+        self.assertIsNone(r["pss_kb"])
+        self.assertIsNone(r["vmrss_kb"])
+        self.assertEqual([x for x in adb.calls if "meminfo" in " ".join(x)], [])
+
+    def test_pid_present_still_uses_smaps_rollup(self):
+        # 有 pid 时行为不变：smaps_rollup 优先，同源双值
+        adb = MockAdb({"cat /proc/5838/smaps_rollup": "Rss:  100000 kB\nPss:  90000 kB\n"})
+        c = MemCollector(adb, MockResolver(5838), package="com.tencent.mm")
+        r = c.sample(1.0)
+        self.assertEqual(r["pss_kb"], 90000)
+        self.assertEqual(r["vmrss_kb"], 100000)
+
+
+class TestScriptSafeJson(unittest.TestCase):
+    """自包含报告内联 JSON 的 </script> 注入防护（2026-09-11）。"""
+
+    def test_closing_script_tag_escaped_and_roundtrip(self):
+        rows = [{"t_ms": 0, "log": "</script><script>alert(1)</script>"}]
+        s = script_safe_json(rows, ensure_ascii=False)
+        self.assertNotIn("</script>", s)
+        self.assertIn("<\\/script>", s)
+        self.assertEqual(json.loads(s)[0]["log"], rows[0]["log"])   # JSON 无损
+
+    def test_normal_data_untouched(self):
+        rows = [{"t_ms": 0, "fps": {"fps": 59.9}, "note": "a<b>c</b>"}]
+        self.assertEqual(json.loads(script_safe_json(rows, ensure_ascii=False)), rows)
 
 
 if __name__ == "__main__":

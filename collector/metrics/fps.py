@@ -21,8 +21,10 @@
      即单段，结果不变。对滚动缓冲/满槽稳定（增量法在缓冲满时会恒 0）
   5) 新鲜度：比较缓冲最新帧时间戳是否推进——持续渲染则单调前移，静止/暂停不变
      → FPS 归零（不需要 --latency-clear，避免 clear 后窗口内无帧导致的间歇性 0）
-  6) Jank 率 = 相邻帧间隔 > 2×刷新周期 的占比（PerfDog 同口径，
-     随刷新率自适应：60Hz→33.3ms、90Hz→22.2ms、120Hz→16.7ms）
+  6) Jank 率 = 相邻帧间隔 > 阈值 的帧占比。阈值实际口径（2026-08-27 节奏校准后，
+     2026-09-11 注释校正）：新帧 ≥8 时 阈值 = 2×节奏×1.1（节奏 = 新帧间隔中位数
+     吸附最近标准 vsync 档，容差 10%）；新帧不足 8 回退 2×刷新周期。
+     并非纯"2×刷新周期"口径，详见 _jank_threshold_ns 与常量区注释
   7) 百分位/Jank 只算本次新增帧（2026-08-21）：128 槽缓冲 ~2.13s 数据窗 > 0.5s 采样
      间隔，若对全缓冲 gaps 计算，一次 2–3.6s 的卡死帧会留缓冲 30–60s，期间每个采样点
      的 P95/Max/Jank 被重复污染 → 只对 ts > 上次缓冲最大时间戳的新增帧算 gaps
@@ -58,6 +60,23 @@ MAX_VALID_TS = 10 ** 17
 # 0.5s ≈ 60fps 下缺 30 帧，远超"渲染节奏"尺度，不会误切正常抖动。
 FPS_SEGMENT_GAP_NS = 500_000_000
 
+# ---- FPS 物理上限钳制与低帧数告警（2026-09-11）----
+# 主段仅少数帧时 span 极短，(帧数-1)/span 可输出非物理值（如 2 帧相隔 0.5ms
+# → 2000 FPS）。上限 = 已知刷新率 ×FPS_CAP_REFRESH_FACTOR（帧率物理上界是
+# 刷新率，留 50% 余量给 refresh_ns 上报偏低的机型）；刷新率未知/超出物理窗口
+# （1..1000Hz）时兜底 FPS_CAP_FALLBACK_HZ。钳制发生时结果带 fps_clamped=True。
+FPS_CAP_REFRESH_FACTOR = 1.5
+FPS_CAP_FALLBACK_HZ = 240.0
+# 主段帧数下限：低于此值 FPS 读数统计上不可靠（单帧抖动即可大幅改变结果），
+# 结果带 fps_warn="low_frames"——数值仍输出（已受上限钳制保护），供前端/
+# 健全性规则标注"低置信"。正常连续缓冲（≥8 帧）不受影响。
+FPS_MIN_SEGMENT_FRAMES = 8
+# 刷新周期物理窗口（ns）：正常面板在 1ms(1000Hz)..1s(1Hz) 之间。--latency
+# 首行超出此窗口视为解析异常（哨兵/坏首行数字），不采用、回退默认 60Hz，
+# 保证落盘 refresh_hz 恒为正数（下游 1000/hz 不会除零）。
+FPS_REFRESH_NS_MIN = 1_000_000
+FPS_REFRESH_NS_MAX = 1_000_000_000
+
 
 def _main_segment(timestamps):
     """按相邻间隔 > FPS_SEGMENT_GAP_NS 切段，返回帧数最多的段（时间戳连续切片）。
@@ -89,6 +108,13 @@ def _main_segment(timestamps):
 # Jank 78.6% vs hz=60 段 3.9%）。
 # 修复：新帧 ≥MIN 时用 gaps 中位数作"实际呈现节奏"，吸附最近标准 vsync 档
 # （10% 容差），阈值 = 2×节奏×1.1；新帧不足回退 refresh_ns 口径。
+# 口径声明（2026-09-11 校正，替代早先"PerfDog 同口径 2×"的表述）：
+#   实际阈值 = 2×节奏×1.1（即 2.2×节奏）。1.1 是亚毫秒抖动容差（60fps 帧间隔
+#   在 16.64~16.70ms 间抖动，硬取 2.0×16.67=33.33ms 会误伤 33.4ms 的正常帧）。
+#   已知局限：节奏取新帧 gaps 中位数——若 0.5s 新帧窗口内卡顿帧占比 >50%，
+#   中位数被卡顿间隔占据 → 阈值随卡顿自我抬升，Jank 率被系统性低估（此时
+#   FPS 曲线会同步跳水，可交叉判读）；data_health 的 fake_jank 规则只覆盖
+#   "Jank 虚高"反方向，不覆盖此低估方向。
 _VSYNC_STANDARDS_MS = (16.6667, 11.1111, 8.3333, 6.9444)  # 60/90/120/144Hz
 JANK_RHYTHM_TOLERANCE = 1.1      # 阈值 = 2×节奏×1.1（亚毫秒抖动容差）
 JANK_RHYTHM_SNAP = 0.10          # 吸附标准档的容差（10%）
@@ -291,23 +317,30 @@ class FpsCollector:
     def _parse_latency(out):
         """解析 --latency 输出。
 
-        返回 (refresh_ns, frame_timestamps)。帧时间戳取第二列（actualPresentTime），
+        返回 (refresh_ns, frame_timestamps)。刷新周期取**首个非空行**（旧实现按
+        "物理第 0 行"判定，输出带前导空行时刷新周期会被误当帧时间戳）；该行须为
+        纯数字且落在物理窗口 [FPS_REFRESH_NS_MIN, FPS_REFRESH_NS_MAX] 才采用，
+        保证落盘 refresh_hz 恒为正数。帧时间戳取第二列（actualPresentTime），
         单列格式直接取值；0 与哨兵值（>3 年）丢弃。
         """
         lines = out.splitlines()
         refresh = DEFAULT_REFRESH_NS
         timestamps = []
-        for i, line in enumerate(lines):
+        first_seen = False
+        for line in lines:
             s = line.strip()
             if not s:
                 continue
-            if i == 0:
+            if not first_seen:
+                first_seen = True
                 m = re.match(r"^(\d+)$", s)
                 if m:
+                    # 首个非空行为纯数字 → 刷新周期行，不再当帧数据
                     v = int(m.group(1))
-                    if v > 0:
+                    if FPS_REFRESH_NS_MIN <= v <= FPS_REFRESH_NS_MAX:
                         refresh = v
-                continue
+                    continue
+                # 非纯数字（坏首行）→ 保持旧行为：按帧数据解析（通常被 isdigit 过滤）
             if "\t" in s:
                 cols = s.split("\t")
                 t = cols[1] if len(cols) >= 2 else cols[0]
@@ -341,6 +374,20 @@ class FpsCollector:
                 rhythm = std
                 break
         return rhythm * JANK_MULTIPLIER * JANK_RHYTHM_TOLERANCE * 1e6  # ns
+
+    def _fps_cap(self):
+        """FPS 物理上限（2026-09-11）：已知刷新率时 = 刷新率×FPS_CAP_REFRESH_FACTOR。
+
+        帧率物理上界是刷新率；×1.5 的余量是给 refresh_ns 上报偏低的机型
+        （如面板报 120Hz 档但实际逐帧节奏 60fps，此时 FPS 读数不会超过
+        节奏值本身，不会触碰 180 上限）。刷新率超出物理窗口（1..1000Hz）
+        时用 FPS_CAP_FALLBACK_HZ 兜底。
+        """
+        if self.refresh_ns:
+            hz = 1e9 / self.refresh_ns
+            if 1.0 <= hz <= 1000.0:
+                return hz * FPS_CAP_REFRESH_FACTOR
+        return FPS_CAP_FALLBACK_HZ
 
     def sample(self, ts):
         # gfx 通道（普通 View 应用）优先走增量
@@ -408,12 +455,32 @@ class FpsCollector:
         # 背景：OPPO 的 SF 缓冲 128 帧时间戳稀疏分布在约 35 分钟里，旧版全缓冲
         # 首尾跨度算出病态低值（127/2108s ≈ 0.06 → 显示 0.01）；荣耀等连续缓冲
         # 全缓冲即单段，行为与旧版一致。静止判断（advancing/stale）语义不变。
+        #
+        # 【口径说明 / 2026-09-11】FPS 与 Jank/P95 的时间窗不同，是有意保留的设计，
+        # 勿"顺手统一"：
+        #   - FPS 用全缓冲主段窗口（荣耀连续缓冲约 2.13s；OPPO 稀疏缓冲为主段
+        #     跨度）——滚动缓冲下每个采样点都是一段平均节奏，读数稳定；
+        #   - Jank/P50/P95 只用 0.5s 新增帧窗口——防止一次卡死帧在滚动缓冲里
+        #     滞留 30-60s、期间重复污染每个采样点（2026-08-21 修复）。
+        #   因此同一点位可能出现"FPS 正常但 Jank 偏高"：FPS 是均值（被非卡顿帧
+        #   稀释），Jank 是短窗瞬时值。解读以持续段为准，勿用单点互相对质。
         if n >= 2 and (self._last_max_ts is None or advancing):
             main_seg = _main_segment(timestamps)
             if len(main_seg) >= 2:
                 span_s = (main_seg[-1] - main_seg[0]) / 1e9
                 if span_s > 0:
-                    result["fps"] = round((len(main_seg) - 1) / span_s, 2)
+                    fps_raw = (len(main_seg) - 1) / span_s
+                    cap = self._fps_cap()
+                    if fps_raw > cap:
+                        # 物理上限钳制（2026-09-11）：主段帧数极少时 span 极短，
+                        # 裸算可输出非物理值（2 帧相隔 0.5ms → 2000 FPS）
+                        result["fps"] = round(cap, 2)
+                        result["fps_clamped"] = True
+                    else:
+                        result["fps"] = round(fps_raw, 2)
+                    if len(main_seg) < FPS_MIN_SEGMENT_FRAMES:
+                        # 主段帧数过少 → 读数统计上不可靠（低置信），数值仍落盘
+                        result["fps_warn"] = "low_frames"
             else:
                 result["fps"] = 0.0   # 缓冲内仅孤立帧，无可测渲染节奏
         else:
@@ -425,7 +492,7 @@ class FpsCollector:
 
         # Jank 率 / 帧时间百分位：只对本次新增帧计算（2026-08-21 修复缓冲残留污染）。
         # 新增帧 = ts > 上次缓冲最大时间戳 的条目；首轮（_last_seen_ts=None）取全缓冲。
-        # FPS 值仍用全缓冲 span（保持滚动缓冲下的稳定性，不受此影响）。
+        # 注意与上面 FPS 的口径差异（见上方"口径说明"注释）：这是有意的时间窗分工。
         new_ts = timestamps if self._last_seen_ts is None \
             else [t for t in timestamps if t > self._last_seen_ts]
         if timestamps:
