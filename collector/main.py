@@ -53,6 +53,9 @@ def load_config(path):
 # 阻塞到 timeout（20s）时仍按 1s 节奏空转猛撞超时、把告警拖到最坏 3 分钟。
 FAIL_ALERT_STREAK = 3
 BACKOFF_MAX_S = 5.0
+# 目标一致性自检间隔（秒，独立线程跑；2026-09-11）——不能放主采样循环：
+# 设备半死时 dumpsys 会阻塞到 adb 超时（20s），把采样点间隔拉到 21s。
+MISMATCH_CHECK_INTERVAL = 10.0
 
 
 def backoff_sleep(base_iv, fail_streak):
@@ -429,6 +432,55 @@ def main():
         th.start()
         threads.append(th)
 
+    # 目标一致性自检（2026-09-11）：层里的 AppBrandUI(n) 应与正在采集的 appbrand(n)
+    # 一致；不一致说明微信把渲染切到了别的实例（cpu/mem/net 采错进程）。
+    # ⚠️ 必须独立线程：设备半死时 dumpsys 会阻塞到 adb 超时（20s），若放在主采样
+    # 循环内会把采样点间隔拉长到 ~21s（2026-09-11 真机实测到该现象）。
+    # **不自动切换**——切换前必然先采一段错数据；只写事件行 + 页面告警。
+    def _mismatch_watch():
+        state = {"msg": None}
+        while not stop["flag"]:
+            time.sleep(MISMATCH_CHECK_INTERVAL)
+            if stop["flag"] or not chosen_pid:
+                continue
+            try:
+                from probe import pick_game_layer, appbrand_index
+                lname, lidx = pick_game_layer(
+                    adb.shell(["dumpsys", "SurfaceFlinger", "--list"]))
+                pidx = appbrand_index(resolver.proc_name or "")
+                if lidx is not None and pidx is not None and lidx != pidx:
+                    msg = (f"渲染层 AppBrandUI{lidx} 与采集进程 appbrand{pidx} 不一致"
+                           f"（pid={resolver.pid}）——cpu/内存可能采错进程")
+                    if msg != state["msg"]:
+                        state["msg"] = msg
+                        print(f"[!] 目标错配: {msg}", flush=True)
+                        try:
+                            with open(out_file, "a", encoding="utf-8") as mf:
+                                mf.write(json.dumps({
+                                    "ts": round(time.time(), 3),
+                                    "event": "target_mismatch",
+                                    "layer": lname,
+                                    "layer_index": lidx,
+                                    "pid_index": pidx,
+                                    "pid": resolver.pid,
+                                }, ensure_ascii=False) + "\n")
+                        except Exception:
+                            pass
+                        if web:
+                            web.set_status(mismatch={"layer": lname, "layer_index": lidx,
+                                                     "pid_index": pidx, "pid": resolver.pid,
+                                                     "message": msg})
+                elif state["msg"]:
+                    state["msg"] = None
+                    if web:
+                        web.set_status(mismatch=None)
+            except Exception:
+                pass
+
+    if chosen_pid:
+        threading.Thread(target=_mismatch_watch, daemon=True,
+                         name="mismatch-watch").start()
+
     start = time.time()
     n = 0
     # 设备断连诊断（2026-08-21）：连续 N 轮多数指标报错 → 探活 adb devices 醒目告警
@@ -437,9 +489,6 @@ def main():
     # 数据健全性实时自检（2026-08-27）：每轮对当前快照跑轻量规则，连续命中才告警，
     # 复用断连告警的"连续 N 轮才提醒"思路，避免单点噪声刷屏
     health_streak = {}
-    # 目标一致性自检状态（2026-09-11）：层 AppBrandUI(n) 与采集进程 appbrand(n) 比对
-    last_mismatch_check = 0.0
-    mismatch_state = {"msg": None}
     with open(out_file, "w", encoding="utf-8") as f:
         # meta 行（2026-08-26）：首行写入核数等采集元信息，供历史报告读取核数，
         # 不依赖当前是否连接设备。event 行不参与采样点统计（前端 prepareRows 过滤）。
@@ -489,46 +538,6 @@ def main():
             health_alerts, health_streak = check_rows_live(row, health_streak)
             for msg in health_alerts:
                 print(f"[!] 数据健全性告警: {msg}", flush=True)
-
-            # 目标一致性自检（2026-09-11，随启动向导引入）：FPS 层名里的 AppBrandUI(n)
-            # 应与正在采集的 appbrand(n) 一致；不一致说明微信把渲染切到了别的实例
-            # （此时 cpu/mem/net 采的是错进程）。**不自动切换**——切换前必然先采一段
-            # 错数据；这里只写事件行 + 页面告警，由用户决定"停止重选/继续"。
-            if chosen_pid and (time.time() - last_mismatch_check >= 5.0):
-                last_mismatch_check = time.time()
-                try:
-                    from probe import pick_game_layer, appbrand_index, layer_appbrand_index
-                    lname, lidx = pick_game_layer(
-                        adb.shell(["dumpsys", "SurfaceFlinger", "--list"]))
-                    pidx = appbrand_index(resolver.proc_name or "")
-                    if lidx is not None and pidx is not None and lidx != pidx:
-                        msg = (f"渲染层 AppBrandUI{lidx} 与采集进程 appbrand{pidx} 不一致"
-                               f"（pid={resolver.pid}）——cpu/内存可能采错进程")
-                        if msg != mismatch_state.get("msg"):
-                            mismatch_state["msg"] = msg
-                            print(f"[!] 目标错配: {msg}", flush=True)
-                            try:
-                                with open(out_file, "a", encoding="utf-8") as mf:
-                                    mf.write(json.dumps({
-                                        "ts": round(time.time(), 3),
-                                        "event": "target_mismatch",
-                                        "layer": lname,
-                                        "layer_index": lidx,
-                                        "pid_index": pidx,
-                                        "pid": resolver.pid,
-                                    }, ensure_ascii=False) + "\n")
-                            except Exception:
-                                pass
-                            if web:
-                                web.set_status(mismatch={"layer": lname, "layer_index": lidx,
-                                                         "pid_index": pidx, "pid": resolver.pid,
-                                                         "message": msg})
-                    elif mismatch_state.get("msg"):
-                        mismatch_state["msg"] = None
-                        if web:
-                            web.set_status(mismatch=None)
-                except Exception:
-                    pass
 
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()

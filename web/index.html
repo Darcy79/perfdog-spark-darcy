@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 实时看板</title>
-<link rel="stylesheet" href="/assets/style.css?v=59">
+<link rel="stylesheet" href="/assets/style.css?v=60">
 </head>
 <body>
 <header>
@@ -50,7 +50,7 @@
 <main>
   <div class="drag-hint">↕ 拖动卡片可调整顺序（自动记住）</div>
   <section class="chart-card">
-    <div class="chart-head"><h2>FPS / Jank</h2><div id="stat-fps" class="stat-line"></div></div>
+    <div class="chart-head"><h2>FPS / Jank<span class="h2-q" title="FPS = SurfaceFlinger 上屏帧率（受屏幕刷新率封顶：60Hz 屏≤60）。引擎/开发者工具显示的多为「渲染循环帧率」（可达 61~63），两者口径不同、数值对不上属正常，非采集异常。详见 指标说明.md「一、1 口径对比」">?</span></h2><div id="stat-fps" class="stat-line"></div></div>
     <div id="chart-fps" class="chart"></div>
   </section>
   <section class="chart-card">
@@ -79,8 +79,8 @@
   <span>自研 PerfDog · 数据仅存本地（output/*.jsonl）· <a href="/report.html">历史报告 →</a></span>
 </footer>
 
-<script src="/assets/echarts.min.js?v=59"></script>
-<script src="/assets/app.js?v=59"></script>
+<script src="/assets/echarts.min.js?v=60"></script>
+<script src="/assets/app.js?v=60"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };

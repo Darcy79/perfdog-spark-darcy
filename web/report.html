@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PerfDog 自研工具 · 历史报告</title>
-<link rel="stylesheet" href="/assets/style.css?v=59">
+<link rel="stylesheet" href="/assets/style.css?v=60">
 </head>
 <body>
 <header>
@@ -57,14 +57,16 @@
           卡顿率 = 各采样点 jank_rate 的<b>算术平均</b>（非总 jank 帧 / 总帧）<br>
           网络 = 整机流量（除 lo），非进程级<br>
           Jank 判定 = 2 × 节奏 × 1.1；节奏 = 帧间隔中位数吸附 60/90/120/144Hz 档（10% 容差）<br>
-          FPS = 0.5s gap 切段取帧数最多主段，主段 (帧数−1) / span
+          FPS = 0.5s gap 切段取帧数最多主段，主段 (帧数−1) / span<br>
+          <b>FPS 口径</b> = 上屏帧率（SurfaceFlinger，受屏幕刷新率封顶，60Hz 屏≤60）；引擎/开发者工具的「渲染循环帧率」是另一口径（可达 61~63），数值对不上属正常<br>
+          帧时间 P50≈P95≈Max（如 16.7 / 16.8 / 17.2ms）在无卡顿窗口属正常——只统计新增帧
         </div>
       </div>
       <!-- v48（UI优化 3.1）：全局单时间条（控制所有图表缩放），原 6 图各挂一条已去除 -->
       <div class="global-slider-wrap" id="global-slider-wrap" style="display:none"></div>
       <div class="summary" id="report-summary"></div>
       <section class="chart-card">
-        <div class="chart-head"><h2>FPS / Jank</h2><div id="stat-fps" class="stat-line"></div></div>
+        <div class="chart-head"><h2>FPS / Jank<span class="h2-q" title="FPS = SurfaceFlinger 上屏帧率（受屏幕刷新率封顶：60Hz 屏≤60）。引擎/开发者工具显示的多为「渲染循环帧率」（可达 61~63），两者口径不同、数值对不上属正常，非采集异常。详见 指标说明.md「一、1 口径对比」">?</span></h2><div id="stat-fps" class="stat-line"></div></div>
         <div id="chart-fps" class="chart"></div>
       </section>
       <section class="chart-card">
@@ -95,8 +97,8 @@
 <!-- v48（UI优化 3.4）：深色 toast 浮层（替代失败类 alert） -->
 <div class="pd-toast" id="pd-toast"></div>
 
-<script src="/assets/echarts.min.js?v=59"></script>
-<script src="/assets/app.js?v=59"></script>
+<script src="/assets/echarts.min.js?v=60"></script>
+<script src="/assets/app.js?v=60"></script>
 <script>
 (function () {
   var charts = { fps: null, frametime: null, cpu: null, mem: null, net: null, temp: null };
